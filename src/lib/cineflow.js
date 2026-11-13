@@ -5,11 +5,21 @@ const BASE_URL = process.env.CINEFLOW_BASE_URL || 'https://ngintipya2.cineflow.m
 // Persist token & cache state across Next.js route workers and HMR reloads
 const globalState = globalThis.__cineflowState || (globalThis.__cineflowState = {
   currentAccessToken: null,
-  currentRefreshToken: process.env.CINEFLOW_REFRESH_TOKEN || '',
+  currentRefreshToken: (process.env.CINEFLOW_REFRESH_TOKEN || '').trim(),
+  lastEnvRefreshToken: (process.env.CINEFLOW_REFRESH_TOKEN || '').trim(),
+  lastTokenError: null,
   refreshPromise: null,
   memoryCache: new Map(),
   inFlightRequests: new Map(),
 });
+
+const envRefreshToken = (process.env.CINEFLOW_REFRESH_TOKEN || '').trim();
+if (envRefreshToken && globalState.lastEnvRefreshToken !== envRefreshToken) {
+  globalState.currentRefreshToken = envRefreshToken;
+  globalState.lastEnvRefreshToken = envRefreshToken;
+  globalState.currentAccessToken = null;
+  globalState.lastTokenError = null;
+}
 
 // In-memory cache map with TTL
 const memoryCache = globalState.memoryCache;
@@ -100,6 +110,11 @@ export async function refreshAccessToken() {
   if (globalState.refreshPromise) return globalState.refreshPromise;
 
   globalState.refreshPromise = (async () => {
+    if (!globalState.currentRefreshToken) {
+      globalState.lastTokenError = 'Token belum dipasang (CINEFLOW_REFRESH_TOKEN kosong).';
+      globalState.refreshPromise = null;
+      return false;
+    }
     try {
       const res = await fetch(`${BASE_URL}api/app/auth/refresh-token`, {
         method: 'POST',
@@ -121,9 +136,18 @@ export async function refreshAccessToken() {
         if (info.access_token) {
           globalState.currentAccessToken = info.access_token;
           if (info.refresh_token) globalState.currentRefreshToken = info.refresh_token;
+          globalState.lastTokenError = null;
           console.log('[CineFlow] Access token refreshed successfully.');
           return true;
         }
+      }
+      const errMsg = json?.message || `HTTP ${res.status}`;
+      if (errMsg === 'refresh_token_user_suspended') {
+        globalState.lastTokenError = 'Token tidak bisa dipakai: Akun CineFlow di-suspend (refresh_token_user_suspended). Silakan ganti CINEFLOW_REFRESH_TOKEN baru.';
+      } else if (errMsg === 'refresh_token_invalid' || errMsg === 'refresh_token_expired' || res.status === 401) {
+        globalState.lastTokenError = `Token tidak bisa dipakai: Token tidak valid atau kedaluwarsa (${errMsg}). Silakan ganti CINEFLOW_REFRESH_TOKEN baru.`;
+      } else {
+        globalState.lastTokenError = `Token tidak bisa dipakai (${errMsg}).`;
       }
       console.warn('[CineFlow] Refresh token failed:', res.status, JSON.stringify(json));
       return false;
@@ -147,7 +171,9 @@ export async function cineflowRequest(endpoint, options = {}) {
   await throttleRequest();
 
   // If no access token yet, refresh first
+  let alreadyTriedRefresh = false;
   if (!globalState.currentAccessToken) {
+    alreadyTriedRefresh = true;
     await refreshAccessToken();
   }
 
@@ -178,7 +204,7 @@ export async function cineflowRequest(endpoint, options = {}) {
   }
 
   // If token expired, refresh and retry once
-  if (isTokenExpired(data, res.status)) {
+  if (!alreadyTriedRefresh && isTokenExpired(data, res.status)) {
     const refreshed = await refreshAccessToken();
     if (refreshed) {
       headers['Authorization'] = `Bearer ${globalState.currentAccessToken}`;
@@ -248,6 +274,9 @@ export async function cineflowRequest(endpoint, options = {}) {
  */
 function requireResult({ data, ok, status }) {
   if (!ok || data?.success === false || Number(data?.code) >= 400 || !data || typeof data !== 'object') {
+    if ((status === 401 || status === 403 || isTokenExpired(data, status)) && globalState.lastTokenError) {
+      throw new Error(globalState.lastTokenError);
+    }
     const message = status === 429 ? 'Server sedang sibuk. Coba lagi sebentar.' : 'Sumber sedang tidak tersedia. Silakan coba lagi.';
     throw new Error(message);
   }
