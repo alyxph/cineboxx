@@ -94,6 +94,7 @@ function generateTrSignature(method, urlStr, bodyData = '', timestamp = Date.now
 }
 
 function getDeviceClientInfo() {
+  globalMovieboxState.deviceId ||= '86820305' + crypto.randomInt(1000000, 10000000);
   return {
     package_name: 'com.community.oneroom',
     version_name: '4.0.02',
@@ -101,7 +102,7 @@ function getDeviceClientInfo() {
     os: 'android',
     os_version: '14',
     install_ch: 'ps',
-    device_id: '86820305' + Math.floor(1000000 + Math.random() * 9000000),
+    device_id: globalMovieboxState.deviceId,
     install_store: 'ps',
     gaid: '',
     brand: 'Google',
@@ -120,7 +121,12 @@ function getDeviceClientInfo() {
 export async function getVisitorToken(force = false) {
   // Direct token override from environment variable
   const envToken = (process.env.MOVIEBOX_TOKEN || '').trim();
-  if (envToken) {
+  if (force) {
+    globalMovieboxState.rejectedEnvToken = envToken;
+    globalMovieboxState.token = null;
+    globalMovieboxState.tokenExpiry = 0;
+  }
+  if (envToken && !force && envToken !== globalMovieboxState.rejectedEnvToken) {
     globalMovieboxState.token = envToken;
     return envToken;
   }
@@ -277,7 +283,7 @@ export async function movieboxRequest(method, endpoint, params = {}, body = null
       'X-Sign-Version': '2.0',
       'X-Client-Token': generateClientToken(),
       'X-Client-Info': JSON.stringify(getDeviceClientInfo()),
-      'X-Client-Status': '0',
+      'X-Client-Status': authToken ? '0' : '1',
       'X-Play-Mode': '2',
       'appid': '4U01pxRu278GqCZKY9',
       'region': 'IN',
@@ -318,9 +324,10 @@ export async function movieboxRequest(method, endpoint, params = {}, body = null
   let result = await makeCall(token);
 
   // If token expired, refresh and retry once
-  if ([401, 403].includes(Number(result.json?.code)) || [401, 403].includes(result.status)) {
+  if ([401, 403, 440].includes(Number(result.json?.code)) || [401, 403, 440].includes(result.status)) {
     console.warn('[MovieBox] Token rejected, re-authenticating visitor...');
     token = await getVisitorToken(true);
+    if (!token) throw Object.assign(new Error('MovieBox menolak autentikasi dari server. Login ulang otomatis tidak berhasil.'), { status: 502 });
     result = await makeCall(token);
   }
 
@@ -329,12 +336,19 @@ export async function movieboxRequest(method, endpoint, params = {}, body = null
       !Object.hasOwn(result.json, 'data') ||
       result.json.success === false ||
       (code !== undefined && ![0, 200].includes(Number(code)))) {
+    const message = String(result.json?.message || result.json?.msg || '');
+    const reason = /signature|signing/i.test(message) ? 'validasi signature'
+      : /appid|appkey|app_id|app_key/i.test(message) ? 'identitas aplikasi'
+        : /token|jwt|session/i.test(message) ? 'autentikasi'
+          : /\bip\b|region|country|blocked/i.test(message) ? 'kebijakan akses' : '';
     // Never log response bodies or authorization headers: they may contain credentials.
     console.warn('[MovieBox] Upstream rejected request', { endpoint, status: result.status,
-      code: typeof code === 'number' || (typeof code === 'string' && /^\d+$/.test(code)) ? code : undefined });
+      code: typeof code === 'number' || (typeof code === 'string' && /^\d+$/.test(code)) ? code : undefined, reason });
     throw Object.assign(new Error(result.status === 429
       ? 'MovieBox membatasi permintaan. Coba lagi sesaat lagi.'
-      : `MovieBox menolak permintaan katalog (HTTP ${result.status}${code !== undefined && /^\d+$/.test(String(code)) ? `, kode ${code}` : ''}).`),
+      : result.status === 440 || Number(code) === 440
+        ? `MovieBox tetap menolak permintaan (440) setelah autentikasi diperbarui.${reason ? ` Alasan: ${reason}.` : ' Perlu pemeriksaan akses server ke MovieBox.'}`
+        : `MovieBox menolak permintaan katalog (HTTP ${result.status}${code !== undefined && /^\d+$/.test(String(code)) ? `, kode ${code}` : ''}).`),
     { status: result.status === 429 ? 503 : 502 });
   }
   return result.json;

@@ -7,7 +7,7 @@ const watch = (id = 'a', live = true) => `/watch?${new URLSearchParams({ id, mod
 
 async function mockApi(page, source, { channelDelay = 0 } = {}) {
   const requests = [];
-  await page.route('**/api/cineflow/**', async (route) => {
+  await page.route('**/api/catalog/**', async (route) => {
     const url = new URL(route.request().url());
     const name = url.pathname.split('/').at(-1);
     let response = { success: true };

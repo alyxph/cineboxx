@@ -2,6 +2,7 @@
 
 import { useState, useEffect, useRef, useCallback, useEffectEvent } from 'react';
 import Hls from 'hls.js';
+import { browserSupportsHevc, isHevcSource, playbackSource } from '@/lib/transcode-sources';
 import {
   Play,
   Pause,
@@ -21,14 +22,11 @@ import {
   PictureInPicture2,
   RadioOff,
   Tv,
-  AlertTriangle,
-  Copy,
   Film,
-  X,
 } from 'lucide-react';
 import { saveProgress, getProgress } from '@/lib/storage';
 import { fetchJson } from '@/lib/http';
-import { isLiveVideo, streamKind, proxyUrl, normalizeSources, LIVE_SOURCE_TIMEOUT, LIVE_START_TIMEOUT, LIVE_STALL_TIMEOUT } from '@/lib/playback';
+import { isLiveVideo, streamKind, proxyUrl, normalizeSources, createHlsSessionId, LIVE_SOURCE_TIMEOUT, LIVE_START_TIMEOUT, LIVE_STALL_TIMEOUT } from '@/lib/playback';
 import { parseSubtitleText } from '@/lib/subtitles';
 
 const RECOMMENDED_MOVIES = [
@@ -119,13 +117,13 @@ function PlayerSession({
   const [buffering, setBuffering] = useState(false);
   const [error, setError] = useState(null);
   const [isChannelOffline, setIsChannelOffline] = useState(false);
-  const [hevcIssue, setHevcIssue] = useState(false);
-  const [copySuccess, setCopySuccess] = useState('');
+  const resumePositionRef = useRef(null);
+
   const [notice, setNotice] = useState('');
   const [episodeBanner, setEpisodeBanner] = useState(null);
   const [ended, setEnded] = useState(false);
   const failedStreams = useRef(new Set());
-  const autoSwitchedHevc = useRef(false);
+
 
   // Stream data
   const [streams, setStreams] = useState([]);
@@ -171,7 +169,7 @@ function PlayerSession({
 
   const failStream = useEffectEvent((message, reason = 'unavailable') => {
     const offline = navigator.onLine === false;
-    if (selectedStream) failedStreams.current.add(selectedStream);
+    if (selectedStream) failedStreams.current.add(selectedStream.originalSource || selectedStream);
     const next = !offline && reason === 'unavailable'
       ? streams.find((stream) => !failedStreams.current.has(stream))
       : null;
@@ -179,7 +177,7 @@ function PlayerSession({
       setNotice('Sumber bermasalah. Mencoba sumber video lain...');
       setLoading(true);
       setBuffering(false);
-      setSelectedStream(next);
+      setSelectedStream(playbackSource(next, browserSupportsHevc(videoRef.current)));
       return;
     }
     const info = offline ? 'Koneksi internet terputus. Hubungkan kembali lalu tekan Coba Lagi.' : message;
@@ -223,9 +221,7 @@ function PlayerSession({
     }, 6000);
   });
 
-  // Each content/retry has its own mounted session; keep container & video mounted across episodes so fullscreen stays active.
-  useEffect(() => {
-    const controller = new AbortController();
+  const resetForSource = useEffectEvent(() => {
     const isEpisodeSwitch =
       prevEpisodeIdRef.current != null &&
       episode?.id != null &&
@@ -238,13 +234,13 @@ function PlayerSession({
 
     failedStreams.current.clear();
     loadedIframeUrl.current = '';
-    autoSwitchedHevc.current = false;
+    resumePositionRef.current = null;
     setLoading(true);
     setBuffering(false);
     setError(null);
     setIsChannelOffline(false);
-    setHevcIssue(false);
-    setCopySuccess('');
+
+
     setNotice('');
     setEnded(false);
     setIsPlaying(false);
@@ -258,12 +254,17 @@ function PlayerSession({
     setSelectedSubtitle(null);
     setSubtitleCues([]);
     setCurrentSubtitleText('');
-
+  });
+  useEffect(() => {
+    const controller = new AbortController();
+    // Reset episode state while retaining the fullscreen media element.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    resetForSource();
     async function loadSource() {
       try {
         const params = new URLSearchParams({ model_id: video.modelId, id: video.id });
         if (episode?.id != null) params.set('episode_id', episode.id);
-        const json = await fetchJson(`/api/cineflow/source?${params}`, {
+        const json = await fetchJson(`/api/catalog/source?${params}`, {
           signal: controller.signal, timeoutMs: isLive ? LIVE_SOURCE_TIMEOUT : 30000,
         });
         if (controller.signal.aborted) return;
@@ -277,7 +278,7 @@ function PlayerSession({
           return rank[streamKind(a)] - rank[streamKind(b)];
         });
         setStreams(ordered);
-        setSelectedStream(ordered[0]);
+        setSelectedStream(playbackSource(ordered[0], browserSupportsHevc(videoRef.current)));
         if (data.duration && data.duration > 0) {
           setKnownDuration(data.duration);
         }
@@ -332,10 +333,13 @@ function PlayerSession({
     let lastTime = -1;
     let lastProgress = Date.now();
     let mediaRecoveries = 0;
+    let closeHlsSession = () => {};
+    const isTranscodedHls = selectedStream.headers?.['x-transcode-format'] === 'hls';
     const startedAt = Date.now();
-    const startupLimit = isLive ? LIVE_START_TIMEOUT : 22000;
-    const stallLimit = isLive ? LIVE_STALL_TIMEOUT : 18000;
-    const savedPos = isLive ? 0 : getProgress(video.id, episode?.id);
+    const startupLimit = isLive ? LIVE_START_TIMEOUT : (isTranscodedHls ? 70000 : 22000);
+    const stallLimit = isLive ? LIVE_STALL_TIMEOUT : (isTranscodedHls ? 55000 : 18000);
+    const savedPos = isLive ? 0 : (resumePositionRef.current ?? getProgress(video.id, episode?.id));
+    resumePositionRef.current = null;
     const listeners = [];
     const listen = (target, event, handler, options) => {
       target?.addEventListener(event, handler, options);
@@ -345,6 +349,7 @@ function PlayerSession({
       if (disposed || failed) return;
       failed = true;
       hls?.stopLoad();
+      closeHlsSession();
       videoEl.pause();
       audioEl?.pause();
       failStream(message, reason);
@@ -406,21 +411,15 @@ function PlayerSession({
     });
     listen(videoEl, 'play', () => { autoplayBlocked = false; lastProgress = Date.now(); });
     listen(videoEl, 'pause', () => { setBuffering(false); });
+    const fallbackHevc = () => {
+      if (disposed || failed || isTranscodedMedia || !isHevcSource(selectedStream) || selectedStream.transcodeAllowed === false) return false;
+      resumePositionRef.current = videoEl.currentTime || savedPos;
+      setLoading(true);
+      setSelectedStream(playbackSource(selectedStream.originalSource || selectedStream, false, true));
+      return true;
+    };
     listen(videoEl, 'error', () => {
-      if (!hls && !shakaPlayer && videoEl.currentSrc) {
-        if (!selectedStream?.headers?.['x-transcode']) {
-          const h264Alternative = streams.find(
-            (s) => s !== selectedStream && s.headers?.['x-transcode'] === 'h264'
-          );
-          if (h264Alternative) {
-            setNotice('Menyesuaikan format video untuk browser Anda...');
-            setTimeout(() => setNotice(''), 4000);
-            setSelectedStream(h264Alternative);
-            return;
-          }
-        }
-        fail('Sumber video tidak dapat diakses atau format tidak didukung.');
-      }
+      if (!hls && !shakaPlayer && videoEl.currentSrc && !fallbackHevc()) fail('Sumber video tidak dapat diputar.');
     });
     listen(videoEl, 'ended', () => {
       if (isLive) fail('Siaran telah berhenti. Mencari saluran lain.');
@@ -437,47 +436,7 @@ function PlayerSession({
         if (Math.abs(videoEl.currentTime - lastTime) > 0.05) {
           lastTime = videoEl.currentTime;
           lastProgress = now;
-          if (!isLive && videoEl.currentTime > 4) {
-            const isCurrentlyHevc =
-              /hevc|h265/i.test(selectedStream?.name || '') ||
-              /h265/i.test(selectedStream?.url || '');
-            const isBlankVideo = isCurrentlyHevc && videoEl.videoWidth === 0 && videoEl.videoHeight === 0;
-
-            if (isBlankVideo) {
-              if (!autoSwitchedHevc.current) {
-                autoSwitchedHevc.current = true;
-                const h264Alternative = streams.find(
-                  (s) => s.url !== selectedStream?.url && (/h264|h\.264|avc/i.test(s.name) || s.headers?.['x-transcode'] === 'h264')
-                ) || streams.find((s) => s.headers?.['x-transcode'] === 'h264' && s !== selectedStream);
-
-                if (h264Alternative) {
-                  setHevcIssue(false);
-                  seekOffsetRef.current = 0;
-                  setSelectedStream(h264Alternative);
-                  setNotice('Beralih otomatis ke format kompatibel...');
-                  setTimeout(() => setNotice(''), 4500);
-                } else if (!selectedStream?.headers?.['x-transcode']) {
-                  setHevcIssue(false);
-                  seekOffsetRef.current = 0;
-                  const transcoded = {
-                    ...selectedStream,
-                    name: `${selectedStream.name} (H.264 Universal)`,
-                    headers: {
-                      ...selectedStream.headers,
-                      'x-transcode': 'h264',
-                    },
-                  };
-                  setSelectedStream(transcoded);
-                  setNotice('Memulai pemutaran mode kompatibel (H.264)...');
-                  setTimeout(() => setNotice(''), 4500);
-                }
-              } else {
-                setHevcIssue(true);
-              }
-            } else if (videoEl.videoWidth > 0) {
-              setHevcIssue(false);
-            }
-          }
+          if (!isLive && videoEl.currentTime > 4 && videoEl.videoWidth === 0 && fallbackHevc()) return;
         } else if (now - lastProgress >= stallLimit) {
           fail('Siaran terhenti atau terlalu lama melakukan buffering.');
         }
@@ -485,13 +444,30 @@ function PlayerSession({
     }, 500);
 
     let streamHeaders = { ...(selectedStream.headers || {}) };
-    if (isTranscodedMedia && savedPos > 5 && !seekOffsetRef.current) {
+    if (isTranscodedMedia && !isTranscodedHls && savedPos > 5 && !seekOffsetRef.current) {
       seekOffsetRef.current = savedPos;
       streamHeaders.ss = String(Math.floor(savedPos));
     }
 
     const kind = streamKind(selectedStream);
-    const playUrl = proxyUrl(selectedStream.url, streamHeaders);
+    const sessionId = isTranscodedHls ? createHlsSessionId() : undefined;
+    const playUrl = proxyUrl(selectedStream.url, streamHeaders, sessionId);
+    if (isTranscodedHls) {
+      seekOffsetRef.current = 0;
+      const sessionUrl = '/api/transcode/session?' + new URLSearchParams({ sid: sessionId });
+      let closed = false;
+      const heartbeat = setInterval(() => { fetch(sessionUrl, { method: 'POST' }).catch(() => {}); }, 30000);
+      closeHlsSession = () => {
+        if (closed) return;
+        closed = true; clearInterval(heartbeat);
+        if (!navigator.sendBeacon?.(sessionUrl + '&close=1')) fetch(sessionUrl + '&close=1', { method: 'POST', keepalive: true }).catch(() => {});
+      };
+      listen(window, 'pagehide', closeHlsSession);
+      listen(videoEl, 'loadedmetadata', () => {
+        if (Number.isFinite(videoEl.duration)) setKnownDuration(videoEl.duration);
+        if (!hls && savedPos > 0 && savedPos < videoEl.duration - 1) videoEl.currentTime = savedPos;
+      }, { once: true });
+    }
     if (kind === 'dash') {
       (async () => {
         try {
@@ -555,15 +531,18 @@ function PlayerSession({
       })();
     } else if (kind === 'hls') {
       if (Hls.isSupported()) {
-        const policy = { default: { maxTimeToFirstByteMs: 6000, maxLoadTimeMs: 8000,
+        const policy = { default: { maxTimeToFirstByteMs: isTranscodedHls ? 50000 : 6000, maxLoadTimeMs: isTranscodedHls ? 55000 : 8000,
           timeoutRetry: { maxNumRetry: 1, retryDelayMs: 300, maxRetryDelayMs: 600 },
           errorRetry: { maxNumRetry: 1, retryDelayMs: 300, maxRetryDelayMs: 600 },
         } };
-        hls = new Hls({ enableWorker: true, lowLatencyMode: true, maxBufferLength: 30,
+        hls = new Hls({ enableWorker: true, lowLatencyMode: !isTranscodedHls, maxBufferLength: isTranscodedHls ? 60 : 30,
+          startPosition: isTranscodedHls ? Math.max(0, savedPos) : -1, backBufferLength: 120,
           manifestLoadPolicy: policy, playlistLoadPolicy: policy, fragLoadPolicy: policy });
         hlsRef.current = hls;
+        if (isTranscodedHls) hls.on(Hls.Events.LEVEL_LOADED, (_, data) => { if (!disposed) setKnownDuration(data.details.totalduration); });
         hls.on(Hls.Events.ERROR, (_, data) => {
           if (disposed || failed || !data.fatal) return;
+          if (data.type === Hls.ErrorTypes.MEDIA_ERROR && fallbackHevc()) return;
           if (data.type === Hls.ErrorTypes.MEDIA_ERROR && mediaRecoveries++ < 1) {
             hls.recoverMediaError();
           } else fail('Sumber HLS tidak dapat diputar atau sedang offline.');
@@ -584,6 +563,7 @@ function PlayerSession({
     return () => {
       disposed = true;
       clearInterval(watchdog);
+      closeHlsSession();
       listeners.forEach((remove) => remove());
       hls?.destroy();
       if (hlsRef.current === hls) hlsRef.current = null;
@@ -596,7 +576,7 @@ function PlayerSession({
         media.load();
       }
     };
-  }, [selectedStream, isIframe, isLive, video.id, episode?.id]);
+  }, [selectedStream, streams, isIframe, isLive, video.id, episode?.id]);
 
   useEffect(() => {
     for (const media of [videoRef.current, audioRef.current]) {
@@ -614,7 +594,7 @@ function PlayerSession({
   const handleTimeUpdate = () => {
     if (!videoRef.current) return;
     const time = videoRef.current.currentTime;
-    setCurrentTime(time);
+    setCurrentTime(time + (seekOffsetRef.current || 0));
 
     // Sync separate audio track
     if (audioRef.current && selectedStream?.audioUrl) {
@@ -642,24 +622,6 @@ function PlayerSession({
       setCurrentSubtitleText(match ? match.text : '');
     } else {
       setCurrentSubtitleText('');
-    }
-  };
-
-    const handleCopyStreamLink = () => {
-    if (!selectedStream) return;
-    const urlToCopy = proxyUrl(selectedStream.url, selectedStream.headers);
-    const fullUrl = typeof window !== 'undefined'
-      ? `${window.location.origin}${urlToCopy}`
-      : urlToCopy;
-    if (navigator?.clipboard?.writeText) {
-      navigator.clipboard.writeText(fullUrl).then(() => {
-        setCopySuccess('Link Tersalin!');
-        setTimeout(() => setCopySuccess(''), 3500);
-      }).catch(() => {
-        prompt('Salin tautan stream video untuk VLC / browser lain (Ctrl+C):', fullUrl);
-      });
-    } else {
-      prompt('Salin tautan stream video untuk VLC / browser lain (Ctrl+C):', fullUrl);
     }
   };
 
@@ -698,21 +660,21 @@ function PlayerSession({
   }, []);
 
   const isTranscodedStream = selectedStream?.headers?.['x-transcode'] === 'h264';
-  const effectiveDuration = isTranscodedStream && knownDuration > 0
+  const effectiveDuration = selectedStream?.headers?.['x-transcode-format'] === 'hls' && duration > 0 ? duration : isTranscodedStream && knownDuration > 0
     ? knownDuration
     : ((knownDuration > 0 && (duration <= 30 || !Number.isFinite(duration)))
       ? knownDuration
       : (Number.isFinite(duration) && duration > 30 ? duration : (knownDuration || duration || 0)));
 
-  const displayedTime = Math.max(0, currentTime + (seekOffsetRef.current || 0));
+  const displayedTime = Math.max(0, currentTime);
   const progressPercent = effectiveDuration > 0 ? Math.min(100, (displayedTime / effectiveDuration) * 100) : 0;
 
   const handleSeek = (val) => {
     if (!videoRef.current || isLive) return;
-    const isTranscoded = selectedStream?.headers?.['x-transcode'] === 'h264';
+    const isTranscoded = selectedStream?.headers?.['x-transcode'] === 'h264' && selectedStream.headers?.['x-transcode-format'] !== 'hls';
     if (isTranscoded) {
       seekOffsetRef.current = val;
-      setCurrentTime(0);
+      setCurrentTime(val);
       setLoading(true);
       const targetUrl = proxyUrl(selectedStream.url, {
         ...selectedStream.headers,
@@ -1001,89 +963,6 @@ function PlayerSession({
             className="hidden"
           />
         </>
-      )}
-
-      {hevcIssue && !error && (
-        <div className="absolute top-4 left-4 right-4 z-30 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 p-3.5 sm:p-4 rounded-xl bg-[#141724]/95 border border-amber-500/40 shadow-2xl backdrop-blur-md text-white animate-in fade-in duration-200">
-          <div className="flex items-start gap-3 min-w-0">
-            <div className="w-8 h-8 rounded-lg bg-amber-500/20 text-amber-400 flex items-center justify-center shrink-0 mt-0.5 sm:mt-0">
-              <AlertTriangle className="w-5 h-5" />
-            </div>
-            <div>
-              <div className="flex items-center gap-2">
-                <h4 className="text-xs sm:text-sm font-bold text-amber-300">
-                  Hanya Suara yang Terdengar? (Layar Hitam)
-                </h4>
-                <span className="text-[10px] bg-amber-500/20 text-amber-300 px-1.5 py-0.5 rounded font-mono">
-                  HEVC / H.265
-                </span>
-              </div>
-              <p className="text-[11px] sm:text-xs text-gray-300 mt-0.5 leading-relaxed">
-                Browser ini memerlukan format H.264 untuk menampilkan gambar. Klik <strong>Ganti ke H.264</strong> agar video langsung tampil normal.
-              </p>
-            </div>
-          </div>
-
-          <div className="flex items-center gap-2 w-full sm:w-auto shrink-0 pt-1 sm:pt-0">
-            <button
-              onClick={() => {
-                setHevcIssue(false);
-                const h264Alternative = streams.find(
-                  (s) => s.url !== selectedStream?.url && (/h264|h\.264|avc/i.test(s.name) || s.headers?.['x-transcode'] === 'h264')
-                ) || streams.find((s) => s.headers?.['x-transcode'] === 'h264');
-
-                if (h264Alternative) {
-                  setSelectedStream(h264Alternative);
-                } else if (!selectedStream?.headers?.['x-transcode']) {
-                  setSelectedStream({
-                    ...selectedStream,
-                    name: `${selectedStream.name} (H.264 Universal)`,
-                    headers: {
-                      ...selectedStream.headers,
-                      'x-transcode': 'h264',
-                    },
-                  });
-                }
-              }}
-              className="flex-1 sm:flex-none flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-lg bg-[#e50914] hover:bg-[#ff2b3e] text-white text-xs font-semibold shadow-md transition-all"
-              title="Putar video dengan format H.264 yang didukung semua browser"
-            >
-              <Play className="w-3.5 h-3.5 fill-current" />
-              <span>Ganti ke H.264</span>
-            </button>
-
-            <button
-              onClick={handleCopyStreamLink}
-              className="flex-1 sm:flex-none flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-lg bg-white/10 hover:bg-white/20 text-white text-xs font-medium transition-colors"
-              title="Salin link untuk diputar di VLC / MPV / PotPlayer"
-            >
-              {copySuccess ? <Check className="w-3.5 h-3.5 text-green-400" /> : <Copy className="w-3.5 h-3.5" />}
-              <span>{copySuccess ? 'Tersalin!' : 'Salin Link VLC'}</span>
-            </button>
-
-            {streams.length > 1 && (
-              <button
-                onClick={() => {
-                  setShowSettingsMenu(true);
-                  setSettingsTab('quality');
-                }}
-                className="flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-lg bg-white/10 hover:bg-white/20 text-white text-xs font-medium transition-colors"
-                title="Ganti Kualitas / Resolusi"
-              >
-                <Settings className="w-3.5 h-3.5" />
-                <span className="hidden xs:inline">Kualitas</span>
-              </button>
-            )}
-
-            <button
-              onClick={() => setHevcIssue(false)}
-              className="p-1.5 rounded-lg hover:bg-white/10 text-gray-400 hover:text-white transition-colors"
-              title="Tutup pemberitahuan"
-            >
-              <X className="w-4 h-4" />
-            </button>
-          </div>
-        </div>
       )}
 
       {notice && !error && (
@@ -1417,16 +1296,17 @@ function PlayerSession({
                     </button>
                     <div className="max-h-56 overflow-y-auto py-1 space-y-0.5">
                       {streams.map((st, idx) => {
-                        const isSelected = selectedStream === st;
+                        const isSelected = (selectedStream?.originalSource || selectedStream) === st;
                         return (
                           <button
                             key={idx}
                             onClick={() => {
-                              if (selectedStream === st) return;
+                              if ((selectedStream?.originalSource || selectedStream) === st) return;
                               failedStreams.current.clear();
                               setError(null);
                               setLoading(true);
-                              setSelectedStream(st);
+                              resumePositionRef.current = videoRef.current?.currentTime || 0;
+                              setSelectedStream(playbackSource(st, browserSupportsHevc(videoRef.current)));
                               setShowSettingsMenu(false);
                               setSettingsTab('main');
                             }}

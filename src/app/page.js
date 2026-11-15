@@ -139,7 +139,7 @@ function HomeContent() {
     const signal = abortControllerRef.current?.signal;
 
     try {
-      let url = `/api/cineflow/videos?model_id=${encodeURIComponent(sourceId)}&page=${targetPage}`;
+      let url = `/api/catalog/videos?model_id=${encodeURIComponent(sourceId)}&page=${targetPage}`;
       if (catId) {
         url += `&category_id=${encodeURIComponent(catId)}`;
       }
@@ -198,7 +198,7 @@ function HomeContent() {
       setLoadingVideos(true);
       const currentCatSeq = ++catSeqRef.current;
       try {
-        const json = await fetchJson(`/api/cineflow/categories?model_id=${encodeURIComponent(sourceId)}`);
+        const json = await fetchJson(`/api/catalog/categories?model_id=${encodeURIComponent(sourceId)}`);
         if (currentCatSeq !== catSeqRef.current) return;
 
         const cats = json.success && Array.isArray(json.data) ? json.data : [];
@@ -236,7 +236,7 @@ function HomeContent() {
     setLoadingSources(true);
     setError(null);
     try {
-      const json = await fetchJson('/api/cineflow/sources');
+      const json = await fetchJson('/api/catalog/sources');
       if (json.success && Array.isArray(json.data) && json.data.length > 0) {
         setSources(json.data);
 

@@ -11,7 +11,7 @@ async function mockMovie(page, multipleQualities = false) {
     const original = HTMLMediaElement.prototype.canPlayType;
     HTMLMediaElement.prototype.canPlayType = function(type) { return /hvc1|hev1/.test(type) ? '' : original.call(this, type); };
   });
-  await page.route('**/api/cineflow/**', (route) => {
+  await page.route('**/api/catalog/**', (route) => {
     const name = new URL(route.request().url()).pathname.split('/').at(-1);
     const data = name === 'source' ? {
       // Provider duration is deliberately wrong: the probed duration must win.

@@ -19,7 +19,7 @@ function SearchContent({ initialQuery }) {
 
     let active = true;
     const controller = new AbortController();
-    fetchJson(`/api/cineflow/search?q=${encodeURIComponent(q)}`, { signal: controller.signal, timeoutMs: 45000 })
+    fetchJson(`/api/catalog/search?q=${encodeURIComponent(q)}`, { signal: controller.signal, timeoutMs: 45000 })
       .then((json) => {
         if (!active) return;
         if (json.success && Array.isArray(json.videos)) {

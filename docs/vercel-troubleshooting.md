@@ -19,9 +19,9 @@ Perubahan ini menambahkan:
 1. Commit dan push perubahan ke branch yang dipakai proyek Vercel.
 2. Periksa deployment terbaru sudah berstatus Ready dan domain produksi menunjuk
    ke deployment tersebut. Periksa commit SHA-nya sama dengan commit yang dipush.
-3. Buka `/api/cineflow/categories?model_id=Moviebox`. Respons versi terbaru
+3. Buka `/api/catalog/categories?model_id=Moviebox`. Respons versi terbaru
    tidak memuat kategori `indonesia`, `asian`, dan `western`.
-4. Buka `/api/cineflow/videos?model_id=Moviebox&category_id=trending&page=1`.
+4. Buka `/api/catalog/videos?model_id=Moviebox&category_id=trending&page=1`.
    Jika gagal, lihat pesan error dan Runtime Logs untuk `[MovieBox]`.
    Log hanya memuat endpoint/status/kode, tanpa token maupun isi respons.
 

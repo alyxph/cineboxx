@@ -1,11 +1,11 @@
-import { normalizeSources } from './playback.js';
+import { normalizeSources } from '../playback.js';
 import {
   getMovieboxCategories,
   getMovieboxVideos,
   getMovieboxDetail,
   getMovieboxSource,
   searchMoviebox,
-} from './moviebox.js';
+} from '../moviebox.js';
 
 const BASE_URL = process.env.CINEFLOW_BASE_URL || 'https://ngintipya2.cineflow.my.id/';
 
@@ -794,6 +794,7 @@ export async function searchCineflow(query, page = 1) {
     let successfulSearches = 0;
     const seenIds = new Set();
 
+    const searchProviders = async () => {
     for (const ct of contentTypes) {
       try {
         const response = await cineflowRequest('api/modelles/search', {
@@ -841,10 +842,12 @@ export async function searchCineflow(query, page = 1) {
       }
     }
 
+    };
+    const searchMovieboxProvider = async () => {
     // Search MovieBox
     try {
       const mbData = await searchMoviebox(cleanQuery, Number(page));
-      if (Array.isArray(mbData?.videos) && mbData.videos.length > 0) {
+      if (Array.isArray(mbData?.videos)) {
         successfulSearches++;
         for (const item of mbData.videos) {
           const id = String(item.id || '');
@@ -857,6 +860,9 @@ export async function searchCineflow(query, page = 1) {
     } catch (e) {
       console.warn('[Search] MovieBox search error:', e.message);
     }
+
+    };
+    await Promise.all([searchProviders(), searchMovieboxProvider()]);
 
     if (!successfulSearches) throw new Error('Pencarian gagal terhubung ke server. Silakan coba lagi.');
 

@@ -1,6 +1,6 @@
 # 🎬 CineBox Web
 
-Aplikasi web streaming film dan serial TV modern berbasis Next.js 16 (App Router), terintegrasi langsung dengan API CineFlow. Transcode HLS untuk sumber HEVC memerlukan server Node/Docker persisten; lihat [panduan HLS](docs/hls-transcode.md).
+Aplikasi web streaming film dan serial TV modern berbasis Next.js 16 (App Router), memakai MovieBox langsung dan adapter CineFlow opsional untuk sumber tambahan/Live TV. Transcode HLS untuk sumber HEVC memerlukan server Node/Docker persisten; lihat [panduan HLS](docs/hls-transcode.md).
 
 ---
 
@@ -89,7 +89,7 @@ cineboxweb/
 ├── src/
 │   ├── app/
 │   │   ├── api/
-│   │   │   ├── cineflow/
+│   │   │   ├── catalog/
 │   │   │   │   ├── sources/route.js     # API list server film
 │   │   │   │   ├── categories/route.js  # API kategori genre
 │   │   │   │   ├── videos/route.js      # API daftar film & pagination
@@ -108,7 +108,8 @@ cineboxweb/
 │   │   ├── DetailModal.jsx              # Modal detail & pemilih episode
 │   │   └── VideoPlayer.jsx              # Pemutar video kustom Hls.js
 │   └── lib/
-│       ├── cineflow.js                  # Engine koneksi & auth CineFlow
+│       ├── catalog.js                   # Router katalog MovieBox / provider tambahan
+│       ├── providers/cineflow.js         # Adapter CineFlow untuk sumber tambahan
 │       └── storage.js                   # Manajemen Favorit & Riwayat lokal
 ├── package.json
 └── next.config.mjs

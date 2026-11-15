@@ -1,21 +1,5 @@
-import path from 'path';
-import fs from 'fs';
-import { spawn } from 'child_process';
-
-// Resolve real filesystem path for ffmpeg binary (prevent Turbopack \\ROOT\\ virtualization)
-function getFfmpegPath() {
-  const binaryName = process.platform === 'win32' ? 'ffmpeg.exe' : 'ffmpeg';
-  const directPath = path.join(process.cwd(), 'node_modules', 'ffmpeg-static', binaryName);
-  if (fs.existsSync(directPath)) return directPath;
-  try {
-    const pkg = require('ffmpeg-static');
-    if (typeof pkg === 'string' && fs.existsSync(pkg)) return pkg;
-  } catch {}
-  return null;
-}
-
-// Disable TLS unauthorized rejection so proxy can connect to IPTV CDNs with untrusted or self-signed certs
-process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
+import { spawn } from 'node:child_process';
+import { getFfmpegPath } from '../../../lib/hls-transcode.js';
 
 export async function GET(request) {
   try {
@@ -43,6 +27,13 @@ export async function GET(request) {
       return new Response('Unsupported protocol', { status: 400 });
     }
 
+    const validateTarget = (value) => {
+      const parsed = new URL(value);
+      const host = parsed.hostname.toLowerCase().replace(/^\[|\]$/g, '');
+      if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password ||
+          /^(localhost|0\.|127\.|10\.|169\.254\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|::1$|f[cd][0-9a-f]{2}:|fe80:)/i.test(host)) throw Object.assign(new Error('Unsupported stream target'), { status: 400 });
+    };
+    try { validateTarget(targetUrl); } catch { return new Response('Unsupported stream target', { status: 400 }); }
     const isBili =
       targetUrl.includes('bilivideo.com') ||
       targetUrl.includes('akamaized.net') ||
@@ -163,9 +154,22 @@ export async function GET(request) {
       headers['Range'] = range;
     }
 
+    let upstreamUrl = targetUrl;
+    const fetchUpstream = async (url, options) => {
+      for (let redirects = 0; redirects < 6; redirects++) {
+        validateTarget(url);
+        const response = await fetch(url, { ...options, redirect: 'manual', signal: request.signal });
+        if ([301, 302, 303, 307, 308].includes(response.status) && response.headers.get('location')) {
+          const next = new URL(response.headers.get('location'), url).href;
+          await response.body?.cancel(); validateTarget(next); url = next; continue;
+        }
+        upstreamUrl = response.url || url; return response;
+      }
+      throw new Error('Too many stream redirects');
+    };
     let upstreamResponse;
     try {
-      upstreamResponse = await fetch(targetUrl, {
+      upstreamResponse = await fetchUpstream(targetUrl, {
         headers,
         redirect: 'follow',
         cache: 'no-store',
@@ -180,7 +184,7 @@ export async function GET(request) {
           };
           delete retryHeaders['Referer'];
           delete retryHeaders['Origin'];
-          const retryRes = await fetch(targetUrl, {
+          const retryRes = await fetchUpstream(targetUrl, {
             headers: retryHeaders,
             redirect: 'follow',
             cache: 'no-store',
@@ -193,6 +197,7 @@ export async function GET(request) {
         }
       }
     } catch (fetchErr) {
+      if (fetchErr.status === 400) return new Response('Unsupported redirect target', { status: 400 });
       console.warn('Stream proxy upstream connection error:', fetchErr.message);
       return new Response(JSON.stringify({ error: 'channel_offline', message: 'Saluran saat ini sedang offline' }), {
         status: 503,
@@ -211,17 +216,13 @@ export async function GET(request) {
     responseHeaders.set('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
     responseHeaders.set('Access-Control-Allow-Headers', '*');
     responseHeaders.set('Access-Control-Expose-Headers', 'X-Stream-Url');
-    responseHeaders.set('X-Stream-Url', upstreamResponse.url || targetUrl);
+    responseHeaders.set('X-Stream-Url', upstreamUrl);
+    responseHeaders.set('Cache-Control', 'no-store');
 
     if (!upstreamResponse.ok && upstreamResponse.status >= 400) {
-      return new Response(JSON.stringify({ error: 'channel_offline', status: upstreamResponse.status }), {
-        status: 503,
-        headers: {
-          'Content-Type': 'application/json',
-          'Access-Control-Allow-Origin': '*',
-          'X-Stream-Offline': 'true',
-        },
-      });
+      const contentRange = upstreamResponse.headers.get('content-range');
+      if (contentRange) responseHeaders.set('Content-Range', contentRange);
+      return new Response(upstreamResponse.body, { status: upstreamResponse.status, headers: responseHeaders });
     }
 
     const isM3u8 =
@@ -237,7 +238,8 @@ export async function GET(request) {
     // If HLS playlist, rewrite all relative/absolute segment, media, map, and key URLs to go through proxy
     if (isM3u8) {
       const text = await upstreamResponse.text();
-      const parentUrl = new URL(upstreamResponse.url || targetUrl);
+      if (!text.trimStart().startsWith('#EXTM3U')) return new Response('Invalid HLS playlist', { status: 502 });
+      const parentUrl = new URL(upstreamUrl);
 
       const toProxyUrl = (rawUri) => {
         const absUrl = new URL(rawUri, parentUrl).toString();
@@ -298,7 +300,7 @@ export async function GET(request) {
     if (contentRange) responseHeaders.set('Content-Range', contentRange);
 
     const contentLength = upstreamResponse.headers.get('content-length');
-    if (contentLength) responseHeaders.set('Content-Length', contentLength);
+    if (contentLength && !upstreamResponse.headers.get('content-encoding')) responseHeaders.set('Content-Length', contentLength);
 
     return new Response(upstreamResponse.body, {
       status: upstreamResponse.status,

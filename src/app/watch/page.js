@@ -100,7 +100,7 @@ function WatchContent() {
   useEffect(() => {
     if (!isLive) return;
     const controller = new AbortController();
-    fetchJson('/api/cineflow/categories?model_id=CineTv', { signal: controller.signal })
+    fetchJson('/api/catalog/categories?model_id=CineTv', { signal: controller.signal })
       .then((json) => {
         if (controller.signal.aborted) return;
         const categories = Array.isArray(json.data) ? json.data : [];
@@ -115,7 +115,7 @@ function WatchContent() {
   useEffect(() => {
     if (!isLive || !activeTvCatId) return;
     const controller = new AbortController();
-    fetchJson(`/api/cineflow/videos?model_id=CineTv&category_id=${encodeURIComponent(activeTvCatId)}&page=1`, { signal: controller.signal })
+    fetchJson(`/api/catalog/videos?model_id=CineTv&category_id=${encodeURIComponent(activeTvCatId)}&page=1`, { signal: controller.signal })
       .then((json) => {
         if (!Array.isArray(json.videos)) throw new Error('Daftar saluran tidak valid.');
         if (!controller.signal.aborted) {
@@ -181,7 +181,7 @@ function WatchContent() {
   useEffect(() => {
     if (!modelId || !id || isLive || isBlockedContent) return;
     const controller = new AbortController();
-    fetchJson(`/api/cineflow/detail?model_id=${encodeURIComponent(modelId)}&id=${encodeURIComponent(id)}`, { signal: controller.signal })
+    fetchJson(`/api/catalog/detail?model_id=${encodeURIComponent(modelId)}&id=${encodeURIComponent(id)}`, { signal: controller.signal })
       .then((json) => {
         if (!json.data) throw new Error('Detail video tidak tersedia.');
         if (!controller.signal.aborted) setDetailResult({ key: detailKey, data: json.data });
