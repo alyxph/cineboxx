@@ -1,3 +1,10 @@
+export function catalogItems(data) {
+  if (Array.isArray(data)) return data;
+  const lists = [data?.list, data?.items, data?.subjects].filter(Array.isArray);
+  if (lists.length) return lists.find((items) => items.length) || lists[0];
+  throw Object.assign(new Error('Format daftar film MovieBox tidak dikenali. Silakan coba lagi.'), { status: 502 });
+}
+
 // tab-operating returns either titles directly or sections with nested title lists.
 export function tabSubjects(data) {
   const subjects = [];

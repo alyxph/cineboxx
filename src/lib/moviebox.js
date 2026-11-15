@@ -2,7 +2,7 @@ import crypto from 'crypto';
 import { normalizeSources } from './playback.js';
 import { isHlsTranscodingEnabled } from './hls-transcode.js';
 import { movieboxQualities, isHevcSource } from './transcode-sources.js';
-import { tabSubjects } from './moviebox-tabs.js';
+import { tabSubjects, catalogItems } from './moviebox-tabs.js';
 
 const GATEWAY_SECRET_ONLINE = '76iRl07s0xSN9jqmEWAt79EBJZulIQIsV64FZr2O';
 const BASE_URL = 'https://apig.inmoviebox.com';
@@ -288,27 +288,55 @@ export async function movieboxRequest(method, endpoint, params = {}, body = null
       ...(authToken ? { 'token': authToken, 'authorization': `Bearer ${authToken}` } : {}),
     };
 
-    const res = await fetch(urlObj.toString(), {
-      method,
-      headers,
-      body: bodyStr || undefined,
-      cache: 'no-store',
-      signal: AbortSignal.timeout(12000),
-    });
-
-    const json = await res.json();
+    let res;
+    try {
+      res = await fetch(urlObj.toString(), {
+        method,
+        headers,
+        body: bodyStr || undefined,
+        cache: 'no-store',
+        signal: AbortSignal.timeout(12000),
+      });
+    } catch (cause) {
+      const timedOut = ['TimeoutError', 'AbortError'].includes(cause.name);
+      throw Object.assign(new Error(timedOut
+        ? 'MovieBox tidak merespons tepat waktu. Silakan coba lagi.'
+        : 'Server tidak dapat terhubung ke MovieBox. Silakan coba lagi.'), { status: timedOut ? 504 : 502 });
+    }
+    let json;
+    try { json = await res.json(); }
+    catch (cause) {
+      if (['TimeoutError', 'AbortError'].includes(cause.name)) {
+        throw Object.assign(new Error('MovieBox tidak merespons tepat waktu. Silakan coba lagi.'), { status: 504 });
+      }
+      console.warn('[MovieBox] Invalid upstream response', { endpoint, status: res.status });
+      throw Object.assign(new Error(`MovieBox mengirim respons tidak valid (HTTP ${res.status}).`), { status: 502 });
+    }
     return { status: res.status, ok: res.ok, json };
   };
 
   let result = await makeCall(token);
 
   // If token expired, refresh and retry once
-  if (result.json?.code === 401 || result.json?.code === 403 || result.status === 401) {
+  if ([401, 403].includes(Number(result.json?.code)) || [401, 403].includes(result.status)) {
     console.warn('[MovieBox] Token rejected, re-authenticating visitor...');
     token = await getVisitorToken(true);
     result = await makeCall(token);
   }
 
+  const code = result.json?.code;
+  if (!result.ok || !result.json || typeof result.json !== 'object' || Array.isArray(result.json) ||
+      !Object.hasOwn(result.json, 'data') ||
+      result.json.success === false ||
+      (code !== undefined && ![0, 200].includes(Number(code)))) {
+    // Never log response bodies or authorization headers: they may contain credentials.
+    console.warn('[MovieBox] Upstream rejected request', { endpoint, status: result.status,
+      code: typeof code === 'number' || (typeof code === 'string' && /^\d+$/.test(code)) ? code : undefined });
+    throw Object.assign(new Error(result.status === 429
+      ? 'MovieBox membatasi permintaan. Coba lagi sesaat lagi.'
+      : `MovieBox menolak permintaan katalog (HTTP ${result.status}${code !== undefined && /^\d+$/.test(String(code)) ? `, kode ${code}` : ''}).`),
+    { status: result.status === 429 ? 503 : 502 });
+  }
   return result.json;
 }
 
@@ -373,15 +401,12 @@ export function isValidMediaUrl(url = '') {
 export function getMovieboxCategories() {
   return [
     { id: 'trending', name: 'Trending' },
-    { id: 'indonesia', name: 'Indonesia' },
     { id: 'film-indo', name: 'Film Indo' },
     { id: 'series-indo', name: 'Series Indo' },
     { id: 'komedi-indo', name: 'Komedi Indo' },
     { id: 'movie', name: 'Movies' },
     { id: 'tv', name: 'Series' },
     { id: 'anime', name: 'Anime' },
-    { id: 'asian', name: 'Asian' },
-    { id: 'western', name: 'Western' },
     { id: 'kids', name: 'Kids' },
   ];
 }
@@ -624,7 +649,7 @@ export async function getMovieboxDiscover({
     if (genre) payload.genre = genre;
 
     const json = await movieboxRequest('POST', '/wefeed-mobile-bff/subject-api/list', {}, payload);
-    const rawItems = json?.data?.items || [];
+    const rawItems = catalogItems(json?.data);
     const languageNeedle = String(language).trim().toLowerCase();
 
     const filtered = rawItems.filter((item) => {
@@ -715,7 +740,7 @@ export async function getMovieboxVideos({ categoryId = 'trending', page = 1 } = 
       perPage: 24,
     });
 
-    const rawList = json?.data?.list || [];
+    const rawList = catalogItems(json?.data);
     const popularity = (item) => {
       const value = (item?.info || item?.subject || item)?.popularity;
       return value !== null && value !== undefined && value !== '' ? Number(value) : NaN;
@@ -727,7 +752,8 @@ export async function getMovieboxVideos({ categoryId = 'trending', page = 1 } = 
       : rawList;
     const videos = collapseVariantVideos(rankedList.map(mapSubjectToVideo).filter(Boolean));
 
-    const hasMore = rawList.length >= 24;
+    const hasMore = json?.data?.pager?.hasMore !== undefined
+      ? Boolean(json.data.pager.hasMore) : rawList.length >= 24;
 
     const result = { videos, page, hasMore };
     if (videos.length > 0) {

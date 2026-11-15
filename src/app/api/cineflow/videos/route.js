@@ -16,9 +16,15 @@ export async function GET(request) {
     }
 
     const data = await getVideos({ modelId, categoryId, page });
-    return NextResponse.json({ success: true, ...data });
+    return NextResponse.json({ success: true, ...data }, { headers: {
+      'Cache-Control': 'no-store',
+      ...(process.env.VERCEL_GIT_COMMIT_SHA ? { 'X-App-Revision': process.env.VERCEL_GIT_COMMIT_SHA.slice(0, 12) } : {}),
+    } });
   } catch (error) {
     console.error('Error fetching videos:', error);
-    return NextResponse.json({ success: false, error: error.message }, { status: 500 });
+    return NextResponse.json({ success: false, error: error.message }, {
+      status: Number.isInteger(error.status) && error.status >= 400 && error.status < 600 ? error.status : 500,
+      headers: { 'Cache-Control': 'no-store' },
+    });
   }
 }
