@@ -935,7 +935,7 @@ export function parseDurationToSeconds(val) {
   return total;
 }
 
-export async function getMovieboxSource(subjectId, episodeId = '') {
+export async function getMovieboxSource(subjectId, episodeId = '', _depth = 0) {
   let season = 1;
   let episode = 1;
   let isSeries = false;
@@ -1328,11 +1328,12 @@ export async function getMovieboxSource(subjectId, episodeId = '') {
 
   // 8. Automatic Alternative Search for Native H.264 Streams
   // If the title is a dubbed version (e.g. [Hindi]) or only HEVC streams exist,
-  // query the original standard title to grab native H.264 streams
+  // query the original standard title to grab native H.264 streams.
+  // _depth === 0 guard prevents infinite recursion when alt source is also HEVC-only.
   const hasDubMarker = /\[.*?\]/i.test(detail?.title || '');
   const hasOnlyHevc = streams.length > 0 && streams.every((s) => isHevcSource(s) || s.headers?.['x-transcode']);
 
-  if ((hasDubMarker || hasOnlyHevc) && detail?.title) {
+  if (_depth === 0 && (hasDubMarker || hasOnlyHevc) && detail?.title) {
     try {
       const cleanTitle = detail.title.replace(/\[.*?\]|\(.*?\)/g, '').trim();
       const shouldSearch = cleanTitle && cleanTitle.length >= 2 && (hasOnlyHevc || cleanTitle.toLowerCase() !== detail.title.toLowerCase());
@@ -1343,7 +1344,8 @@ export async function getMovieboxSource(subjectId, episodeId = '') {
         );
         if (altVideo) {
           const altEpId = isSeries ? `${altVideo.id}_${season}_${episode}` : String(altVideo.id);
-          const altSrc = await getMovieboxSource(altVideo.id, altEpId);
+          // Pass _depth + 1 so the recursive call does NOT trigger another alt-search
+          const altSrc = await getMovieboxSource(altVideo.id, altEpId, _depth + 1);
           if (altSrc.duration && !mediaDuration) mediaDuration = altSrc.duration;
           for (const st of altSrc.streams || []) {
             const isAltH264 = !isHevcSource(st) && !st.headers?.['x-transcode'];
