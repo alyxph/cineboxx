@@ -129,6 +129,7 @@ function PlayerSession({
   const [episodeBanner, setEpisodeBanner] = useState(null);
   const [ended, setEnded] = useState(false);
   const failedStreams = useRef(new Set());
+  const autoSwitchedHevc = useRef(false);
 
 
   // Stream data
@@ -291,6 +292,7 @@ function PlayerSession({
 
     failedStreams.current.clear();
     loadedIframeUrl.current = '';
+    autoSwitchedHevc.current = false;
     resumePositionRef.current = null;
     resumePausedRef.current = false;
     const qualityKey = `${video.id}:${episode?.id || ''}`;
@@ -554,9 +556,32 @@ function PlayerSession({
       return true;
     };
     listen(videoEl, 'error', () => {
-      if (!hls && !shakaPlayer && videoEl.currentSrc && !fallbackHevc()) {
-        if (isHevcSource(selectedStream)) setHevcIssue(true);
-        fail('Sumber video tidak dapat diputar.');
+      if (!hls && !shakaPlayer && videoEl.currentSrc) {
+        if (isHevcSource(selectedStream) && !autoSwitchedHevc.current && !selectedStream?.headers?.['x-transcode']) {
+          autoSwitchedHevc.current = true;
+          const h264Alternative = streams.find(
+            (s) => s.url !== selectedStream?.url && (!isHevcSource(s) || s.headers?.['x-transcode'] === 'h264')
+          );
+          if (h264Alternative) {
+            setNotice('Beralih otomatis ke format H.264...');
+            setSelectedStream(h264Alternative);
+            return;
+          }
+          setNotice('Format HEVC tidak didukung. Mengonversi otomatis ke H.264...');
+          setSelectedStream({
+            ...selectedStream,
+            name: `${selectedStream.name} (H.264)`,
+            headers: {
+              ...selectedStream.headers,
+              'x-transcode': 'h264',
+            },
+          });
+          return;
+        }
+        if (!fallbackHevc()) {
+          if (isHevcSource(selectedStream)) setHevcIssue(true);
+          fail('Sumber video tidak dapat diputar.');
+        }
       }
     });
     listen(videoEl, 'ended', () => {
@@ -575,8 +600,35 @@ function PlayerSession({
         if (Math.abs(videoEl.currentTime - lastTime) > 0.05) {
           lastTime = videoEl.currentTime;
           lastProgress = now;
-          if (!isLive && videoEl.currentTime > 2.5 && videoEl.videoWidth === 0 && isHevcSource(selectedStream)) {
-            if (!fallbackHevc()) {
+          if (!isLive && videoEl.currentTime > 2 && videoEl.videoWidth === 0 && isHevcSource(selectedStream)) {
+            if (!autoSwitchedHevc.current) {
+              autoSwitchedHevc.current = true;
+              const h264Alternative = streams.find(
+                (s) => s.url !== selectedStream?.url && (!isHevcSource(s) || s.headers?.['x-transcode'] === 'h264')
+              );
+
+              if (h264Alternative) {
+                setHevcIssue(false);
+                seekOffsetRef.current = 0;
+                setSelectedStream(h264Alternative);
+                setNotice('Beralih otomatis ke format kompatibel (H.264)...');
+                setTimeout(() => setNotice(''), 4500);
+              } else if (!selectedStream?.headers?.['x-transcode']) {
+                setHevcIssue(false);
+                seekOffsetRef.current = 0;
+                const transcoded = {
+                  ...selectedStream,
+                  name: `${selectedStream.name} (H.264)`,
+                  headers: {
+                    ...selectedStream.headers,
+                    'x-transcode': 'h264',
+                  },
+                };
+                setSelectedStream(transcoded);
+                setNotice('Mengonversi otomatis ke format H.264...');
+                setTimeout(() => setNotice(''), 4500);
+              }
+            } else {
               setHevcIssue(true);
             }
           } else if (videoEl.videoWidth > 0 && hevcIssue) {
@@ -1136,8 +1188,33 @@ function PlayerSession({
           </div>
           <div className="flex items-center gap-2 w-full sm:w-auto shrink-0 pt-1 sm:pt-0">
             <button
+              onClick={() => {
+                setHevcIssue(false);
+                const h264Alternative = streams.find(
+                  (s) => s.url !== selectedStream?.url && (!isHevcSource(s) || s.headers?.['x-transcode'] === 'h264')
+                );
+                if (h264Alternative) {
+                  setSelectedStream(h264Alternative);
+                } else if (!selectedStream?.headers?.['x-transcode']) {
+                  setSelectedStream({
+                    ...selectedStream,
+                    name: `${selectedStream.name} (H.264)`,
+                    headers: {
+                      ...selectedStream.headers,
+                      'x-transcode': 'h264',
+                    },
+                  });
+                }
+              }}
+              className="flex-1 sm:flex-none flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-lg bg-[#e50914] hover:bg-[#ff2b3e] text-white text-xs font-semibold shadow-md transition-all active:scale-95"
+              title="Putar video dengan format H.264 yang didukung semua browser"
+            >
+              <Play className="w-3.5 h-3.5 fill-current" />
+              <span>Ganti ke H.264</span>
+            </button>
+            <button
               onClick={handleCopyStreamLink}
-              className="flex-1 sm:flex-none flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-lg bg-amber-500 hover:bg-amber-400 text-black text-xs font-semibold shadow-md transition-all active:scale-95"
+              className="flex-1 sm:flex-none flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-lg bg-white/10 hover:bg-white/20 text-white text-xs font-medium transition-colors"
               title="Salin link untuk diputar di VLC / PotPlayer"
             >
               <Copy className="w-3.5 h-3.5" />
@@ -1213,16 +1290,43 @@ function PlayerSession({
                     <AlertTriangle className="w-4 h-4 shrink-0" />
                     <span>Format Video HEVC (H.265)</span>
                   </div>
-                  <p className="text-gray-300 text-[11px] mb-2 leading-relaxed">
-                    Browser ini belum mendukung format kompresi HEVC secara native. Silakan buka situs ini di <strong>Microsoft Edge</strong> / <strong>Safari</strong>, atau putar langsung via VLC / PotPlayer:
+                  <p className="text-gray-300 text-[11px] mb-3 leading-relaxed">
+                    Browser ini belum mendukung format video HEVC secara native. Putar dengan mode konversi H.264 atau buka di VLC / Edge:
                   </p>
-                  <button
-                    onClick={handleCopyStreamLink}
-                    className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-amber-500 hover:bg-amber-400 text-black font-semibold text-xs transition-colors"
-                  >
-                    <Copy className="w-3.5 h-3.5" />
-                    <span>{copySuccess ? 'Link Tersalin!' : 'Salin Link Video untuk VLC'}</span>
-                  </button>
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <button
+                      onClick={() => {
+                        setError(null);
+                        setLoading(true);
+                        const h264Alternative = streams.find(
+                          (s) => s.url !== selectedStream?.url && (!isHevcSource(s) || s.headers?.['x-transcode'] === 'h264')
+                        );
+                        if (h264Alternative) {
+                          setSelectedStream(h264Alternative);
+                        } else {
+                          setSelectedStream({
+                            ...selectedStream,
+                            name: `${selectedStream.name} (H.264)`,
+                            headers: {
+                              ...selectedStream.headers,
+                              'x-transcode': 'h264',
+                            },
+                          });
+                        }
+                      }}
+                      className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-[#e50914] hover:bg-[#ff2b3e] text-white font-semibold text-xs shadow-md transition-all active:scale-95"
+                    >
+                      <Play className="w-3.5 h-3.5 fill-current" />
+                      <span>Putar via Mode H.264</span>
+                    </button>
+                    <button
+                      onClick={handleCopyStreamLink}
+                      className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-white/10 hover:bg-white/20 text-white font-medium text-xs transition-colors"
+                    >
+                      <Copy className="w-3.5 h-3.5" />
+                      <span>{copySuccess ? 'Link Tersalin!' : 'Salin Link VLC'}</span>
+                    </button>
+                  </div>
                 </div>
               )}
 
