@@ -150,8 +150,28 @@ export async function GET(request) {
 
     // Forward range header for video seeking support
     const range = request.headers.get('range');
+    const isM3u8Url =
+      targetUrl.toLowerCase().includes('.m3u8') ||
+      targetUrl.includes('m3u8');
+    const isMpdUrl =
+      targetUrl.toLowerCase().includes('.mpd') ||
+      targetUrl.includes('mpd');
+
+    const CHUNK_SIZE = 5 * 1024 * 1024; // 5 MB chunk limit for streaming on serverless
+
     if (range) {
-      headers['Range'] = range;
+      const match = range.match(/bytes=(\d+)-(\d+)?/);
+      if (match) {
+        const start = parseInt(match[1], 10);
+        const hasEnd = Boolean(match[2]);
+        const end = hasEnd ? parseInt(match[2], 10) : start + CHUNK_SIZE - 1;
+        headers['Range'] = `bytes=${start}-${end}`;
+      } else {
+        headers['Range'] = range;
+      }
+    } else if (!isM3u8Url && !isMpdUrl && (isMovieBox || /\.mp4($|\?)/i.test(targetUrl))) {
+      // For initial MP4 probe without range, request first chunk with 206
+      headers['Range'] = `bytes=0-${CHUNK_SIZE - 1}`;
     }
 
     let upstreamUrl = targetUrl;
@@ -298,6 +318,24 @@ export async function GET(request) {
 
     responseHeaders.set('Accept-Ranges', 'bytes');
 
+    // When upstream returns 206 Partial Content for byte-range requests, read ArrayBuffer
+    // to provide an exact Content-Length header, avoiding Transfer-Encoding: chunked which
+    // breaks video playback on Safari iOS and Android Chrome on serverless runtimes.
+    if (upstreamResponse.status === 206) {
+      const contentRange = upstreamResponse.headers.get('content-range');
+      if (contentRange) responseHeaders.set('Content-Range', contentRange);
+      responseHeaders.set('Cache-Control', 'public, max-age=3600');
+
+      const chunkBuffer = await upstreamResponse.arrayBuffer();
+      responseHeaders.set('Content-Length', String(chunkBuffer.byteLength));
+
+      return new Response(chunkBuffer, {
+        status: 206,
+        statusText: 'Partial Content',
+        headers: responseHeaders,
+      });
+    }
+
     const contentRange = upstreamResponse.headers.get('content-range');
     if (contentRange) responseHeaders.set('Content-Range', contentRange);
 
@@ -326,4 +364,66 @@ export async function OPTIONS() {
   });
 }
 
-export const HEAD = GET;
+export async function HEAD(request) {
+  try {
+    const { searchParams } = new URL(request.url);
+    const targetUrl = searchParams.get('url');
+    if (!targetUrl) return new Response(null, { status: 400 });
+
+    const isBili = targetUrl.includes('bilivideo.com') || targetUrl.includes('bilibili.');
+    const isMovieBox =
+      targetUrl.includes('hakunaymatata.com') ||
+      targetUrl.includes('aoneroom.com') ||
+      targetUrl.includes('inmoviebox.com') ||
+      targetUrl.includes('sportslive.wine') ||
+      targetUrl.includes('vidio-ugc.com') ||
+      targetUrl.includes('fzmovies.cms') ||
+      targetUrl.includes('m-stream.') ||
+      targetUrl.includes('wefeed-');
+
+    let effectiveUserAgent = request.headers.get('user-agent') || 'MovieBox/4.0.02 (Android 14; Pixel 6)';
+    if (isBili) effectiveUserAgent = 'Bilibili Freedome/1.0.0 (Android; 13)';
+    else if (isMovieBox) effectiveUserAgent = 'MovieBox/4.0.02 (Android 14; Pixel 6)';
+
+    // Probe upstream with Range: bytes=0-0 to obtain the exact total Content-Length
+    const upstreamRes = await fetch(targetUrl, {
+      method: 'GET',
+      headers: {
+        'User-Agent': effectiveUserAgent,
+        'Range': 'bytes=0-0',
+      },
+      redirect: 'follow',
+      cache: 'no-store',
+    });
+
+    const responseHeaders = new Headers();
+    responseHeaders.set('Access-Control-Allow-Origin', '*');
+    responseHeaders.set('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
+    responseHeaders.set('Access-Control-Allow-Headers', '*');
+    responseHeaders.set('Access-Control-Expose-Headers', 'X-Stream-Url');
+    responseHeaders.set('X-Stream-Url', upstreamRes.url || targetUrl);
+    responseHeaders.set('Accept-Ranges', 'bytes');
+    responseHeaders.set('Cache-Control', 'public, max-age=3600');
+
+    const contentType = upstreamRes.headers.get('content-type') || 'video/mp4';
+    responseHeaders.set('Content-Type', contentType.includes('octet-stream') ? 'video/mp4' : contentType);
+
+    const contentRange = upstreamRes.headers.get('content-range');
+    let totalLength = upstreamRes.headers.get('content-length');
+    if (contentRange) {
+      const match = contentRange.match(/\/(\d+|\*)$/);
+      if (match && match[1] !== '*') totalLength = match[1];
+    }
+    if (totalLength) {
+      responseHeaders.set('Content-Length', totalLength);
+    }
+
+    await upstreamRes.body?.cancel();
+    return new Response(null, {
+      status: 200,
+      headers: responseHeaders,
+    });
+  } catch {
+    return new Response(null, { status: 502 });
+  }
+}

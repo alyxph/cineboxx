@@ -24,6 +24,9 @@ import {
   RadioOff,
   Tv,
   Film,
+  AlertTriangle,
+  Copy,
+  X,
 } from 'lucide-react';
 import { saveProgress, getProgress } from '@/lib/storage';
 import { fetchJson } from '@/lib/http';
@@ -118,6 +121,8 @@ function PlayerSession({
   const [buffering, setBuffering] = useState(false);
   const [error, setError] = useState(null);
   const [isChannelOffline, setIsChannelOffline] = useState(false);
+  const [hevcIssue, setHevcIssue] = useState(false);
+  const [copySuccess, setCopySuccess] = useState('');
   const resumePositionRef = useRef(null);
 
   const [notice, setNotice] = useState('');
@@ -172,6 +177,36 @@ function PlayerSession({
     return `${m}:${s < 10 ? '0' : ''}${s}`;
   };
 
+
+  const fallbackCopy = (text) => {
+    try {
+      const textarea = document.createElement('textarea');
+      textarea.value = text;
+      textarea.style.position = 'fixed';
+      textarea.style.opacity = '0';
+      document.body.appendChild(textarea);
+      textarea.select();
+      document.execCommand('copy');
+      document.body.removeChild(textarea);
+      setCopySuccess('Link Tersalin!');
+      setTimeout(() => setCopySuccess(''), 3000);
+    } catch {}
+  };
+
+  const handleCopyStreamLink = () => {
+    if (!selectedStream?.url) return;
+    const fullProxyUrl = typeof window !== 'undefined'
+      ? `${window.location.origin}${proxyUrl(selectedStream.url, selectedStream.headers)}`
+      : selectedStream.url;
+    if (navigator.clipboard?.writeText) {
+      navigator.clipboard.writeText(fullProxyUrl).then(() => {
+        setCopySuccess('Link Tersalin!');
+        setTimeout(() => setCopySuccess(''), 3000);
+      }).catch(() => fallbackCopy(fullProxyUrl));
+    } else {
+      fallbackCopy(fullProxyUrl);
+    }
+  };
 
   const failStream = useEffectEvent((message, reason = 'unavailable') => {
     const offline = navigator.onLine === false;
@@ -268,6 +303,8 @@ function PlayerSession({
     setBuffering(false);
     setError(null);
     setIsChannelOffline(false);
+    setHevcIssue(false);
+    setCopySuccess('');
 
 
     setNotice('');
@@ -517,7 +554,10 @@ function PlayerSession({
       return true;
     };
     listen(videoEl, 'error', () => {
-      if (!hls && !shakaPlayer && videoEl.currentSrc && !fallbackHevc()) fail('Sumber video tidak dapat diputar.');
+      if (!hls && !shakaPlayer && videoEl.currentSrc && !fallbackHevc()) {
+        if (isHevcSource(selectedStream)) setHevcIssue(true);
+        fail('Sumber video tidak dapat diputar.');
+      }
     });
     listen(videoEl, 'ended', () => {
       if (isLive) fail('Siaran telah berhenti. Mencari saluran lain.');
@@ -535,7 +575,13 @@ function PlayerSession({
         if (Math.abs(videoEl.currentTime - lastTime) > 0.05) {
           lastTime = videoEl.currentTime;
           lastProgress = now;
-          if (!isLive && videoEl.currentTime > 4 && videoEl.videoWidth === 0 && fallbackHevc()) return;
+          if (!isLive && videoEl.currentTime > 2.5 && videoEl.videoWidth === 0 && isHevcSource(selectedStream)) {
+            if (!fallbackHevc()) {
+              setHevcIssue(true);
+            }
+          } else if (videoEl.videoWidth > 0 && hevcIssue) {
+            setHevcIssue(false);
+          }
         } else if (now - lastProgress >= stallLimit) {
           fail('Siaran terhenti atau terlalu lama melakukan buffering.');
         }
@@ -1067,6 +1113,47 @@ function PlayerSession({
         </>
       )}
 
+      {/* HEVC Video Decoder Warning Banner (e.g. for Chromium Desktop without hardware HEVC) */}
+      {hevcIssue && !error && (
+        <div className="absolute top-3 left-3 right-3 sm:top-4 sm:left-4 sm:right-4 z-40 p-3 sm:p-4 bg-gradient-to-r from-amber-950/95 via-[#161a26]/95 to-[#10131d]/95 border border-amber-500/50 rounded-xl shadow-2xl backdrop-blur-md flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 text-white">
+          <div className="flex items-start gap-2.5">
+            <div className="p-1.5 rounded-lg bg-amber-500/20 text-amber-400 shrink-0 mt-0.5">
+              <AlertTriangle className="w-5 h-5" />
+            </div>
+            <div>
+              <div className="flex items-center gap-2 flex-wrap">
+                <h4 className="text-xs sm:text-sm font-semibold text-amber-200">
+                  Hanya Suara yang Terdengar? (Layar Hitam)
+                </h4>
+                <span className="text-[10px] bg-amber-500/30 text-amber-300 px-1.5 py-0.5 rounded font-mono font-medium">
+                  HEVC / H.265
+                </span>
+              </div>
+              <p className="text-[11px] sm:text-xs text-gray-300 mt-0.5 leading-relaxed">
+                Browser ini belum mengaktifkan akselerasi hardware video H.265. Buka di <strong>Microsoft Edge</strong>, atau putar langsung via <strong>VLC Player</strong>.
+              </p>
+            </div>
+          </div>
+          <div className="flex items-center gap-2 w-full sm:w-auto shrink-0 pt-1 sm:pt-0">
+            <button
+              onClick={handleCopyStreamLink}
+              className="flex-1 sm:flex-none flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-lg bg-amber-500 hover:bg-amber-400 text-black text-xs font-semibold shadow-md transition-all active:scale-95"
+              title="Salin link untuk diputar di VLC / PotPlayer"
+            >
+              <Copy className="w-3.5 h-3.5" />
+              <span>{copySuccess ? 'Link Tersalin!' : 'Salin Link VLC'}</span>
+            </button>
+            <button
+              onClick={() => setHevcIssue(false)}
+              className="p-1.5 rounded-lg hover:bg-white/10 text-gray-400 hover:text-white transition-colors"
+              title="Tutup pemberitahuan"
+            >
+              <X className="w-4 h-4" />
+            </button>
+          </div>
+        </div>
+      )}
+
       {notice && !error && (
         <div role="status" className="absolute top-3 left-3 right-3 z-20 rounded-lg bg-black/85 p-3 text-xs text-white">
           {notice}
@@ -1119,6 +1206,26 @@ function PlayerSession({
               <p className="text-gray-400 text-xs mb-6 max-w-md">
                 Sumber video mungkin sedang offline atau mengalami pembatasan tautan. Silakan coba kembali atau pilih episode/kualitas lain.
               </p>
+
+              {isHevcSource(selectedStream) && (
+                <div className="mb-6 p-3 rounded-xl bg-amber-500/10 border border-amber-500/30 text-amber-200 text-xs max-w-md text-left">
+                  <div className="flex items-center gap-1.5 font-semibold text-amber-300 mb-1">
+                    <AlertTriangle className="w-4 h-4 shrink-0" />
+                    <span>Format Video HEVC (H.265)</span>
+                  </div>
+                  <p className="text-gray-300 text-[11px] mb-2 leading-relaxed">
+                    Browser ini belum mendukung format kompresi HEVC secara native. Silakan buka situs ini di <strong>Microsoft Edge</strong> / <strong>Safari</strong>, atau putar langsung via VLC / PotPlayer:
+                  </p>
+                  <button
+                    onClick={handleCopyStreamLink}
+                    className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-amber-500 hover:bg-amber-400 text-black font-semibold text-xs transition-colors"
+                  >
+                    <Copy className="w-3.5 h-3.5" />
+                    <span>{copySuccess ? 'Link Tersalin!' : 'Salin Link Video untuk VLC'}</span>
+                  </button>
+                </div>
+              )}
+
               <div className="flex items-center gap-3">
                 <button
                   onClick={onRetry}

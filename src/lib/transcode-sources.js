@@ -35,8 +35,22 @@ export function movieboxQualities(streams, transcodeAllowed = true) {
 }
 
 export function browserSupportsHevc(media) {
-  return Boolean(media?.canPlayType('video/mp4; codecs="hvc1.1.6.L93.B0"') ||
-    media?.canPlayType('video/mp4; codecs="hev1.1.6.L93.B0"'));
+  const el = media || (typeof document !== 'undefined' && typeof document.createElement === 'function' ? document.createElement('video') : null);
+  if (!el?.canPlayType) return false;
+  const check = (type) => {
+    try {
+      const res = el.canPlayType(type);
+      return res === 'probably' || res === 'maybe';
+    } catch {
+      return false;
+    }
+  };
+  return Boolean(
+    check('video/mp4; codecs="hvc1.1.6.L93.B0"') ||
+    check('video/mp4; codecs="hev1.1.6.L93.B0"') ||
+    check('video/mp4; codecs="hvc1"') ||
+    check('video/mp4; codecs="hev1"')
+  );
 }
 
 export function playbackSource(source, supportsHevc, force = false) {
