@@ -62,7 +62,8 @@ test('440 retries once with a fresh guest token and stable device, without reusi
     devices.push(JSON.parse(options.headers['X-Client-Info']).device_id);
     if (url.includes('/visitor-login')) {
       logins++;
-      return Response.json({ code: 0, data: { token: 'fresh-440' } });
+      assert.equal(options.headers['X-Client-Status'], '1', 'bootstrap must declare an unauthenticated client');
+      return Response.json({ code: '0', data: { token: 'fresh-440' } });
     }
     authorizations.push(options.headers.authorization);
     return authorizations.length === 1 ? Response.json({ code: 440, data: null }, { status: 440 })
@@ -83,6 +84,11 @@ test('440 retries once with a fresh guest token and stable device, without reusi
     };
     await assert.rejects(movieboxRequest('POST', '/test-440', {}, {}), /440.*setelah autentikasi/);
     assert.equal(attempts, 2);
+    process.env.MOVIEBOX_TOKEN = 'gateway-failure-test';
+    globalThis.fetch = async (url) => url.includes('/visitor-login')
+      ? Response.json({ code: 440, message: 'Invalid signature', data: null }, { status: 440 })
+      : Response.json({ code: 440, data: null }, { status: 440 });
+    await assert.rejects(movieboxRequest('POST', '/test-440', {}, {}), /Login tamu MovieBox gagal \(HTTP 440, kode 440, validasi signature\)/);
   } finally {
     globalThis.fetch = previousFetch;
     if (previousToken === undefined) delete process.env.MOVIEBOX_TOKEN;

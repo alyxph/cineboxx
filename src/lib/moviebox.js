@@ -139,6 +139,7 @@ export async function getVisitorToken(force = false) {
   }
 
   globalMovieboxState.visitorPromise = (async () => {
+    globalMovieboxState.authFailure = null;
     try {
       const mbEmail = (process.env.MOVIEBOX_EMAIL || '').trim();
       const mbPass = (process.env.MOVIEBOX_PASSWORD || '').trim();
@@ -167,7 +168,7 @@ export async function getVisitorToken(force = false) {
             'X-Sign-Version': '2.0',
             'X-Client-Token': generateClientToken(),
             'X-Client-Info': JSON.stringify(getDeviceClientInfo()),
-            'X-Client-Status': '0',
+            'X-Client-Status': '1',
             'X-Play-Mode': '2',
             'appid': '4U01pxRu278GqCZKY9',
             'region': 'IN',
@@ -184,7 +185,7 @@ export async function getVisitorToken(force = false) {
             signal: AbortSignal.timeout(10000),
           });
           const loginJson = await loginRes.json();
-          if (loginJson.code === 0 && loginJson.data?.token) {
+          if (loginRes.ok && [0, 200].includes(Number(loginJson.code)) && loginJson.data?.token) {
             globalMovieboxState.token = loginJson.data.token;
             globalMovieboxState.userId = String(loginJson.data.userId || loginJson.data.uid || '');
             globalMovieboxState.tokenExpiry = Date.now() + 14 * 24 * 60 * 60 * 1000;
@@ -215,7 +216,7 @@ export async function getVisitorToken(force = false) {
         'X-Sign-Version': '2.0',
         'X-Client-Token': generateClientToken(),
         'X-Client-Info': JSON.stringify(getDeviceClientInfo()),
-        'X-Client-Status': '0',
+        'X-Client-Status': '1',
         'X-Play-Mode': '2',
         'appid': '4U01pxRu278GqCZKY9',
         'region': 'IN',
@@ -234,7 +235,7 @@ export async function getVisitorToken(force = false) {
       });
 
       const json = await res.json();
-      if (json.code === 0 && json.data?.token) {
+      if (res.ok && [0, 200].includes(Number(json.code)) && json.data?.token) {
         globalMovieboxState.token = json.data.token;
         globalMovieboxState.userId = String(json.data.userId || json.data.uid || '');
         // Cache token for 24 hours (tokens typically last 30 days)
@@ -242,10 +243,19 @@ export async function getVisitorToken(force = false) {
         console.log('[MovieBox] Visitor login successful. User:', globalMovieboxState.userId);
         return globalMovieboxState.token;
       }
-      console.warn('[MovieBox] Visitor login failed:', json.message || json.msg || res.status);
+      const code = /^\d+$/.test(String(json?.code)) ? Number(json.code) : undefined;
+      const message = String(json?.message || json?.msg || '');
+      const reason = /signature|signing/i.test(message) ? 'validasi signature'
+        : /appid|appkey|app_id|app_key/i.test(message) ? 'identitas aplikasi'
+          : /token|jwt|session/i.test(message) ? 'autentikasi'
+            : /\bip\b|region|country|blocked/i.test(message) ? 'kebijakan akses' : '';
+      globalMovieboxState.authFailure = { status: res.status, code, reason };
+      console.warn('[MovieBox] Visitor login failed', globalMovieboxState.authFailure);
       return null;
     } catch (err) {
-      console.error('[MovieBox] Visitor login error:', err);
+      globalMovieboxState.authFailure = { reason: ['TimeoutError', 'AbortError'].includes(err.name)
+        ? 'timeout' : err instanceof SyntaxError ? 'respons non-JSON' : 'koneksi gagal' };
+      console.error('[MovieBox] Visitor login error', globalMovieboxState.authFailure);
       return null;
     } finally {
       globalMovieboxState.visitorPromise = null;
@@ -327,7 +337,12 @@ export async function movieboxRequest(method, endpoint, params = {}, body = null
   if ([401, 403, 440].includes(Number(result.json?.code)) || [401, 403, 440].includes(result.status)) {
     console.warn('[MovieBox] Token rejected, re-authenticating visitor...');
     token = await getVisitorToken(true);
-    if (!token) throw Object.assign(new Error('MovieBox menolak autentikasi dari server. Login ulang otomatis tidak berhasil.'), { status: 502 });
+    if (!token) {
+      const failure = globalMovieboxState.authFailure || {};
+      const details = [failure.status ? `HTTP ${failure.status}` : '',
+        failure.code !== undefined ? `kode ${failure.code}` : '', failure.reason || ''].filter(Boolean).join(', ');
+      throw Object.assign(new Error(`Login tamu MovieBox gagal${details ? ` (${details})` : ''}.`), { status: 502 });
+    }
     result = await makeCall(token);
   }
 
@@ -781,7 +796,7 @@ export async function getMovieboxVideos({ categoryId = 'trending', page = 1 } = 
  * Fetch movie or series detail
  */
 export async function getMovieboxDetail(subjectId) {
-  const cacheKey = `mb_detail_v3_${subjectId}`;
+  const cacheKey = `mb_detail_v4_${subjectId}`;
   return dedupe(cacheKey, async () => {
     const cached = getCached(cacheKey);
     if (cached) return cached;
@@ -869,14 +884,25 @@ export async function getMovieboxDetail(subjectId) {
       });
     }
 
+    const genres = typeof data.genre === 'string'
+      ? data.genre.split(',').map((s) => s.trim()).filter(Boolean)
+      : (Array.isArray(data.genre) ? data.genre : []);
+    const year = data.releaseDate ? String(data.releaseDate).slice(0, 4) : '';
+    const rating = score && score !== '0' ? score : '';
+    const desc = data.description?.trim() || (Array.isArray(data.explains) && data.explains.length > 0 ? data.explains.join('\n') : '') || data.aka || '';
+
     const result = {
       id: String(subjectId),
       title: titleInfo.baseTitle || data.title,
-      description: data.description || '',
+      description: desc,
+      synopsis: desc,
       poster,
-      score: score && score !== '0' ? score : 'N/A',
+      score: rating || 'N/A',
+      rating,
       releaseDate: data.releaseDate || '',
+      year,
       genre: data.genre || '',
+      genres,
       duration: data.duration || '',
       durationSeconds: Number(data.durationSeconds) || 0,
       type: isSeries ? 'tv' : 'movie',

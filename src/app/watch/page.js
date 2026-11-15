@@ -294,7 +294,7 @@ function WatchContent() {
   const hasSidebar = seasons.length > 0 || isLive;
 
   const title = detail?.title || fallbackTitle;
-  const synopsis = detail?.synopsis || '';
+  const synopsis = detail?.synopsis || detail?.description || '';
 
   useEffect(() => {
     document.title = `${title} - CineBox`;

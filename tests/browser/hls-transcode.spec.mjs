@@ -6,11 +6,15 @@ let fixture;
 test.beforeAll(async () => { fixture = await hlsFixture(); });
 test.afterAll(async () => { await fixture?.close(); });
 
-async function mockMovie(page, multipleQualities = false) {
-  await page.addInitScript(() => {
+async function mockMovie(page, multipleQualities = false, downlink = 20) {
+  await page.addInitScript((downlink) => {
+    const connection = Object.assign(new EventTarget(), { downlink, effectiveType: '4g', saveData: false });
+    Object.defineProperty(navigator, 'connection', { configurable: true,
+      value: connection });
+    window.__setDownlink = (value) => { connection.downlink = value; connection.dispatchEvent(new Event('change')); };
     const original = HTMLMediaElement.prototype.canPlayType;
     HTMLMediaElement.prototype.canPlayType = function(type) { return /hvc1|hev1/.test(type) ? '' : original.call(this, type); };
-  });
+  }, downlink);
   await page.route('**/api/catalog/**', (route) => {
     const name = new URL(route.request().url()).pathname.split('/').at(-1);
     const data = name === 'source' ? {
@@ -83,6 +87,36 @@ test('HEVC automatically transcodes selected 720p, 480p and 320p qualities and r
   await page.goto('/search');
 });
 
+test('Auto starts low on slow networks and selecting the current quality locks it without reloading', async ({ page }) => {
+  test.setTimeout(90000);
+  await mockMovie(page, true, 1);
+  const playlists = [];
+  page.on('request', (req) => { if (req.url().includes('/api/transcode/hls?')) playlists.push(req.url()); });
+  await page.goto('/watch?id=auto-quality&model_id=Test&type=movie&title=HEVC');
+  const video = page.locator('video');
+  await expect.poll(() => video.evaluate((v) => v.currentTime), { timeout: 60000 }).toBeGreaterThan(0.2);
+  expect(await video.evaluate((v) => v.videoHeight)).toBe(320);
+  expect(playlists).toHaveLength(1);
+  await page.getByTitle('Setelan (Kualitas & Kecepatan)').click({ force: true });
+  await expect(page.getByText('Auto (320p)', { exact: true })).toBeVisible();
+  await page.getByText('Kualitas', { exact: true }).click();
+  await page.getByText('320p', { exact: true }).click();
+  await page.evaluate(() => window.__setDownlink(30));
+  await page.waitForTimeout(3500);
+  expect(playlists).toHaveLength(1);
+  await page.getByTitle('Setelan (Kualitas & Kecepatan)').click({ force: true });
+  await expect(page.getByText('320p', { exact: true })).toBeVisible();
+  await expect(page.getByText('Auto (320p)', { exact: true })).toHaveCount(0);
+  await video.evaluate((v) => { v.pause(); v.currentTime = 20; });
+  await expect.poll(() => video.evaluate((v) => v.readyState)).toBeGreaterThanOrEqual(2);
+  await page.getByText('Kualitas', { exact: true }).click();
+  await page.getByText('720p', { exact: true }).click();
+  await expect.poll(() => video.evaluate((v) => v.videoHeight), { timeout: 60000 }).toBe(720);
+  await expect.poll(() => video.evaluate((v) => v.currentTime)).toBeCloseTo(20, 0);
+  expect(await video.evaluate((v) => v.paused)).toBe(true);
+  await page.goto('/search');
+});
+
 test('HLS resume starts at the saved absolute position and tab close releases the session', async ({ page, context, request }) => {
   test.setTimeout(90000);
   await mockMovie(page);
@@ -98,6 +132,23 @@ test('HLS resume starts at the saved absolute position and tab close releases th
   await context.newPage();
   await page.close();
   await expect.poll(async () => (await request.post(`/api/transcode/session?sid=${sid}`)).status()).toBe(410);
+});
+
+test('Auto drops a stalled startup instead of waiting for the full HLS deadline', async ({ page }) => {
+  test.setTimeout(90000);
+  await mockMovie(page, true, 20);
+  const heights = [];
+  await page.route('**/api/transcode/hls?**', (route) => {
+    const height = new URL(route.request().url()).searchParams.get('height');
+    heights.push(height);
+    if (height === '720') return;
+    return route.continue();
+  });
+  await page.goto('/watch?id=auto-startup&model_id=Test&type=movie&title=HEVC');
+  await expect.poll(() => page.locator('video').evaluate((v) => v.currentTime), { timeout: 30000 }).toBeGreaterThan(0.2);
+  expect(heights.slice(0, 2)).toEqual(['720', '480']);
+  expect(await page.locator('video').evaluate((v) => v.videoHeight)).toBe(480);
+  await page.goto('/search');
 });
 
 

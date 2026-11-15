@@ -2,7 +2,8 @@
 
 import { useState, useEffect, useRef, useCallback, useEffectEvent } from 'react';
 import Hls from 'hls.js';
-import { browserSupportsHevc, isHevcSource, playbackSource } from '@/lib/transcode-sources';
+import { initialQuality, adaptiveQuality, qualityLadder } from '@/lib/adaptive-quality';
+import { browserSupportsHevc, isHevcSource, playbackSource, sourceResolution } from '@/lib/transcode-sources';
 import {
   Play,
   Pause,
@@ -128,6 +129,11 @@ function PlayerSession({
   // Stream data
   const [streams, setStreams] = useState([]);
   const [selectedStream, setSelectedStream] = useState(null);
+  const [autoQuality, setAutoQuality] = useState(true);
+  const qualityPreference = useRef({ key: '', mode: 'auto', height: 0, url: '' });
+  const qualityHealth = useRef({ changedAt: 0, stableSince: 0, waitingSince: 0 });
+  const resumePausedRef = useRef(false);
+  const loadingPositionRef = useRef(0);
   const [subtitles, setSubtitles] = useState([]);
   const [selectedSubtitle, setSelectedSubtitle] = useState(null);
   const [subtitleCues, setSubtitleCues] = useState([]);
@@ -171,12 +177,22 @@ function PlayerSession({
     const offline = navigator.onLine === false;
     if (selectedStream) failedStreams.current.add(selectedStream.originalSource || selectedStream);
     const next = !offline && reason === 'unavailable'
-      ? streams.find((stream) => !failedStreams.current.has(stream))
+      ? (() => {
+          const available = streams.filter((stream) => !failedStreams.current.has(stream));
+          const height = Number(selectedStream?.resolution) || Number(selectedStream?.name?.match(/(\d+)p/i)?.[1]) || 0;
+          if (!isLive && height) {
+            const lower = qualityLadder(available).filter((stream) => (Number(stream.resolution) || Number(stream.name?.match(/(\d+)p/i)?.[1]) || 0) < height);
+            return autoQuality ? lower.at(-1) : null;
+          }
+          return available[0];
+        })()
       : null;
     if (next && failedStreams.current.size < (isLive ? 2 : 3)) {
       setNotice('Sumber bermasalah. Mencoba sumber video lain...');
       setLoading(true);
       setBuffering(false);
+      resumePositionRef.current = videoRef.current?.currentTime || 0;
+      qualityHealth.current.changedAt = Date.now();
       setSelectedStream(playbackSource(next, browserSupportsHevc(videoRef.current)));
       return;
     }
@@ -235,6 +251,13 @@ function PlayerSession({
     failedStreams.current.clear();
     loadedIframeUrl.current = '';
     resumePositionRef.current = null;
+    resumePausedRef.current = false;
+    const qualityKey = `${video.id}:${episode?.id || ''}`;
+    if (qualityPreference.current.key !== qualityKey) {
+      qualityPreference.current = { key: qualityKey, mode: 'auto', height: 0, url: '' };
+      setAutoQuality(true);
+    }
+    qualityHealth.current = { changedAt: Date.now(), stableSince: Date.now(), waitingSince: 0 };
     setLoading(true);
     setBuffering(false);
     setError(null);
@@ -278,7 +301,13 @@ function PlayerSession({
           return rank[streamKind(a)] - rank[streamKind(b)];
         });
         setStreams(ordered);
-        setSelectedStream(playbackSource(ordered[0], browserSupportsHevc(videoRef.current)));
+        const preference = qualityPreference.current;
+        const manual = preference.mode === 'manual' && ordered.find((stream) => preference.height
+          ? sourceResolution(stream) === preference.height : stream.url === preference.url);
+        const initial = manual || (isLive ? ordered[0] : initialQuality(ordered, navigator.connection));
+        if (preference.mode === 'manual' && !manual) { preference.mode = 'auto'; setAutoQuality(true); }
+        qualityHealth.current.changedAt = Date.now();
+        setSelectedStream(playbackSource(initial, browserSupportsHevc(videoRef.current)));
         if (data.duration && data.duration > 0) {
           setKnownDuration(data.duration);
         }
@@ -320,6 +349,61 @@ function PlayerSession({
     return () => clearTimeout(timer);
   }, [selectedStream, isIframe]);
 
+  const chooseQuality = (source, automatic = false) => {
+    if (!automatic) {
+      qualityPreference.current = { ...qualityPreference.current, mode: 'manual', height: sourceResolution(source), url: source.url };
+      setAutoQuality(false);
+    }
+    const current = selectedStream?.originalSource || selectedStream;
+    if (current === source) return;
+    const media = videoRef.current;
+    resumePositionRef.current = media && media.readyState > 0
+      ? media.currentTime + (seekOffsetRef.current || 0) : (loadingPositionRef.current || 0);
+    resumePausedRef.current = Boolean(media?.paused && media.readyState > 0);
+    qualityHealth.current = { changedAt: Date.now(), stableSince: Date.now(), waitingSince: 0 };
+    failedStreams.current.clear(); setError(null); setLoading(true);
+    setSelectedStream(playbackSource(source, browserSupportsHevc(media), Boolean(selectedStream?.originalSource)));
+  };
+
+  const checkAutoQuality = useEffectEvent((startup = false) => {
+    const starting = startup === true;
+    const media = videoRef.current;
+    if (!autoQuality || isLive || !selectedStream || !media || (!starting && (media.seeking || media.paused)) || media.ended || error) return;
+    // A native HLS/DASH adaptive manifest has its own bandwidth controller.
+    if ((hlsRef.current?.levels?.length || 0) > 1 || shakaRef.current) return;
+    const now = Date.now();
+    let ahead = 0;
+    for (let i = 0; i < media.buffered.length; i++) {
+      if (media.currentTime >= media.buffered.start(i) && media.currentTime <= media.buffered.end(i)) ahead = media.buffered.end(i) - media.currentTime;
+    }
+    const health = qualityHealth.current;
+    const waiting = starting || (media.readyState < 3 && ahead < 1);
+    if (waiting) { health.waitingSince ||= now; health.stableSince = now; }
+    else { health.waitingSince = 0; if (ahead < 10) health.stableSince = now; }
+    const next = adaptiveQuality({ streams: streams.filter((stream) => !failedStreams.current.has(stream)),
+      current: selectedStream, connection: navigator.connection, bufferAhead: ahead,
+      waitingMs: health.waitingSince ? now - health.waitingSince : 0,
+      stableMs: now - health.stableSince, sinceSwitchMs: now - health.changedAt,
+      playing: true, seeking: starting ? false : media.seeking, playbackSeconds: media.currentTime });
+    if (next) chooseQuality(next, true);
+  });
+  const applyManifestQuality = useEffectEvent(() => {
+    const hls = hlsRef.current;
+    if (!hls || hls.levels.length < 2) return;
+    if (autoQuality) { hls.currentLevel = -1; return; }
+    const height = Number(selectedStream?.resolution) || Number(selectedStream?.name?.match(/(\d+)p/i)?.[1]) || 0;
+    if (!height) return;
+    const levels = hls.levels.map((level, index) => ({ height: level.height, index })).sort((a, b) => a.height - b.height);
+    hls.currentLevel = (levels.filter((level) => level.height <= height).at(-1) || levels[0]).index;
+  });
+  useEffect(() => { applyManifestQuality(); }, [autoQuality, selectedStream]);
+  useEffect(() => {
+    const timer = setInterval(checkAutoQuality, 3000);
+    const connection = navigator.connection;
+    connection?.addEventListener?.('change', checkAutoQuality);
+    return () => { clearInterval(timer); connection?.removeEventListener?.('change', checkAutoQuality); };
+  }, []);
+
   useEffect(() => {
     if (!selectedStream || isIframe || !videoRef.current) return;
     const videoEl = videoRef.current;
@@ -329,6 +413,7 @@ function PlayerSession({
     let hls = null;
     let shakaPlayer = null;
     let ready = false;
+    let resumed = false;
     let autoplayBlocked = false;
     let lastTime = -1;
     let lastProgress = Date.now();
@@ -339,6 +424,7 @@ function PlayerSession({
     const startupLimit = isLive ? LIVE_START_TIMEOUT : (isTranscodedHls ? 70000 : 22000);
     const stallLimit = isLive ? LIVE_STALL_TIMEOUT : (isTranscodedHls ? 55000 : 18000);
     const savedPos = isLive ? 0 : (resumePositionRef.current ?? getProgress(video.id, episode?.id));
+    loadingPositionRef.current = savedPos;
     resumePositionRef.current = null;
     const listeners = [];
     const listen = (target, event, handler, options) => {
@@ -384,21 +470,26 @@ function PlayerSession({
       audioEl.load();
       listen(audioEl, 'error', () => fail('Trek audio gagal dimuat.'));
     }
+    const restorePosition = () => {
+      if (!resumed && !isTranscodedMedia && savedPos > 0 && Number.isFinite(videoEl.duration) && savedPos < videoEl.duration - 0.25) {
+        resumed = true; videoEl.currentTime = savedPos;
+        if (selectedStream.audioUrl && audioEl) audioEl.currentTime = savedPos;
+      }
+    };
+    listen(videoEl, 'loadedmetadata', restorePosition);
     listen(videoEl, 'canplay', () => {
       if (disposed || failed) return;
       ready = true;
       setLoading(false);
       setBuffering(false);
-      if (!isTranscodedMedia && savedPos > 5 && Number.isFinite(videoEl.duration) && savedPos < videoEl.duration - 5) {
-        videoEl.currentTime = savedPos;
-        if (selectedStream.audioUrl && audioEl) audioEl.currentTime = savedPos;
-      }
-      play();
+      restorePosition();
+      if (!resumePausedRef.current) play();
     }, { once: true });
     listen(videoEl, 'playing', () => {
       if (failed || disposed) return;
       ready = true;
       autoplayBlocked = false;
+      resumePausedRef.current = false;
       lastProgress = Date.now();
       setLoading(false);
       setBuffering(false);
@@ -424,12 +515,13 @@ function PlayerSession({
     listen(videoEl, 'ended', () => {
       if (isLive) fail('Siaran telah berhenti. Mencari saluran lain.');
     });
-    listen(videoEl, 'seeking', () => { lastProgress = Date.now(); });
+    listen(videoEl, 'seeking', () => { lastProgress = Date.now(); qualityHealth.current.stableSince = Date.now(); });
     listen(window, 'offline', () => fail('Koneksi internet terputus.', 'connection'));
 
     const watchdog = setInterval(() => {
       if (disposed || failed || autoplayBlocked) return;
       const now = Date.now();
+      if (!ready && now - startedAt >= 15000 && !resumePausedRef.current) checkAutoQuality(true);
       if (!ready && now - startedAt >= startupLimit) {
         fail('Sumber tidak merespons dalam batas waktu.');
       } else if (ready && !videoEl.paused && !videoEl.ended) {
@@ -536,9 +628,10 @@ function PlayerSession({
           errorRetry: { maxNumRetry: 1, retryDelayMs: 300, maxRetryDelayMs: 600 },
         } };
         hls = new Hls({ enableWorker: true, lowLatencyMode: !isTranscodedHls, maxBufferLength: isTranscodedHls ? 60 : 30,
-          startPosition: isTranscodedHls ? Math.max(0, savedPos) : -1, backBufferLength: 120,
+          startPosition: Math.max(0, savedPos), backBufferLength: 120,
           manifestLoadPolicy: policy, playlistLoadPolicy: policy, fragLoadPolicy: policy });
         hlsRef.current = hls;
+        hls.on(Hls.Events.MANIFEST_PARSED, applyManifestQuality);
         if (isTranscodedHls) hls.on(Hls.Events.LEVEL_LOADED, (_, data) => { if (!disposed) setKnownDuration(data.details.totalduration); });
         hls.on(Hls.Events.ERROR, (_, data) => {
           if (disposed || failed || !data.fatal) return;
@@ -1259,7 +1352,7 @@ function PlayerSession({
                         </div>
                         <div className="flex items-center gap-1 text-gray-400">
                           <span className="text-xs font-medium text-gray-300 truncate max-w-[80px]">
-                            {selectedStream?.name || 'Auto'}
+                            {autoQuality ? `Auto (${selectedStream?.name || ''})` : selectedStream?.name}
                           </span>
                           <ChevronRight className="w-3.5 h-3.5" />
                         </div>
@@ -1295,18 +1388,22 @@ function PlayerSession({
                       <span>Kualitas Video</span>
                     </button>
                     <div className="max-h-56 overflow-y-auto py-1 space-y-0.5">
+                      <button onClick={() => {
+                        qualityPreference.current.mode = 'auto';
+                        setAutoQuality(true);
+                        qualityHealth.current = { changedAt: Date.now(), stableSince: Date.now(), waitingSince: 0 };
+                        setShowSettingsMenu(false); setSettingsTab('main');
+                      }} className="w-full flex items-center gap-2.5 px-3 py-2 rounded-lg text-xs text-gray-200 hover:bg-white/10">
+                        <span className="w-4 h-4">{autoQuality && <Check className="w-4 h-4" />}</span>
+                        <span>Auto</span>
+                      </button>
                       {streams.map((st, idx) => {
-                        const isSelected = (selectedStream?.originalSource || selectedStream) === st;
+                        const isSelected = !autoQuality && (selectedStream?.originalSource || selectedStream) === st;
                         return (
                           <button
                             key={idx}
                             onClick={() => {
-                              if ((selectedStream?.originalSource || selectedStream) === st) return;
-                              failedStreams.current.clear();
-                              setError(null);
-                              setLoading(true);
-                              resumePositionRef.current = videoRef.current?.currentTime || 0;
-                              setSelectedStream(playbackSource(st, browserSupportsHevc(videoRef.current)));
+                              chooseQuality(st);
                               setShowSettingsMenu(false);
                               setSettingsTab('main');
                             }}
