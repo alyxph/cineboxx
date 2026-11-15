@@ -1,4 +1,11 @@
 import { normalizeSources } from './playback.js';
+import {
+  getMovieboxCategories,
+  getMovieboxVideos,
+  getMovieboxDetail,
+  getMovieboxSource,
+  searchMoviebox,
+} from './moviebox.js';
 
 const BASE_URL = process.env.CINEFLOW_BASE_URL || 'https://ngintipya2.cineflow.my.id/';
 
@@ -289,19 +296,36 @@ export async function getSources() {
     const cached = getCached(cacheKey);
     if (cached) return cached;
 
-    const data = requireResult(await cineflowRequest('api/modelles/models'));
-    let rawList = [];
-    if (Array.isArray(data?.data)) {
-      rawList = data.data;
-    } else if (Array.isArray(data?.data?.data)) {
-      rawList = data.data.data;
-    }
+    const movieboxSource = {
+      id: 'Moviebox',
+      name: 'Moviebox',
+      contentType: 'movie_tv',
+    };
 
-    const list = rawList.filter(Boolean).map((item, idx) => ({
-      id: item.id || item.slug || item.model_id || String(idx),
-      name: item.name || item.title || 'Sumber',
-      contentType: item.content_type || 'movie_tv',
-    }));
+    let list = [movieboxSource];
+
+    try {
+      const data = requireResult(await cineflowRequest('api/modelles/models'));
+      let rawList = [];
+      if (Array.isArray(data?.data)) {
+        rawList = data.data;
+      } else if (Array.isArray(data?.data?.data)) {
+        rawList = data.data.data;
+      }
+
+      const cineflowList = rawList
+        .filter(Boolean)
+        .map((item, idx) => ({
+          id: item.id || item.slug || item.model_id || String(idx),
+          name: item.name || item.title || 'Sumber',
+          contentType: item.content_type || 'movie_tv',
+        }))
+        .filter((item) => String(item.id).toLowerCase() !== 'moviebox');
+
+      list = [movieboxSource, ...cineflowList];
+    } catch (err) {
+      console.warn('[CineFlow] Models fetch failed, using Moviebox as default server:', err.message);
+    }
 
     if (list.length > 0) {
       setCached(cacheKey, list, 600);
@@ -314,6 +338,10 @@ export async function getSources() {
  * Fetch categories for a specific source (cached for 10 min with in-flight deduplication)
  */
 export async function getCategories(modelId) {
+  if (String(modelId || '').toLowerCase() === 'moviebox') {
+    return getMovieboxCategories();
+  }
+
   const cacheKey = `categories:${modelId}`;
   return dedupeRequest(cacheKey, async () => {
     const cached = getCached(cacheKey);
@@ -364,6 +392,10 @@ function isExcludedVideo(item) {
  * Fetch videos with pagination (cached for 2 min with in-flight deduplication)
  */
 export async function getVideos({ modelId, categoryId = '', page = 1 }) {
+  if (String(modelId || '').toLowerCase() === 'moviebox') {
+    return getMovieboxVideos({ categoryId, page });
+  }
+
   let activeCatId = categoryId;
 
   // Auto-resolve category ID if missing (since CineFlow server requires category_id)
@@ -532,6 +564,10 @@ export async function getVideos({ modelId, categoryId = '', page = 1 }) {
  * Fetch movie or series detail (cached for 3 min with in-flight deduplication)
  */
 export async function getMovieDetail(modelId, id) {
+  if (String(modelId || '').toLowerCase() === 'moviebox') {
+    return getMovieboxDetail(id);
+  }
+
   if (isExcludedVideo({ id })) {
     return {
       id: String(id),
@@ -624,6 +660,10 @@ export async function getMovieDetail(modelId, id) {
  * Fetch video streaming sources, subtitles & headers with multi-tier fallback
  */
 export async function getMovieSource(modelId, id, episodeId = '') {
+  if (String(modelId || '').toLowerCase() === 'moviebox') {
+    return getMovieboxSource(id, episodeId);
+  }
+
   let targetEpisodeId = episodeId;
   let fallbackDirectUrl = '';
   const cachedDetail = getCached(`detail:${modelId}:${id}`);
@@ -799,6 +839,23 @@ export async function searchCineflow(query, page = 1) {
       } catch (e) {
         console.warn(`Search error on content_type ${ct}:`, e.message);
       }
+    }
+
+    // Search MovieBox
+    try {
+      const mbData = await searchMoviebox(cleanQuery, Number(page));
+      if (Array.isArray(mbData?.videos) && mbData.videos.length > 0) {
+        successfulSearches++;
+        for (const item of mbData.videos) {
+          const id = String(item.id || '');
+          if (id && !seenIds.has(`Moviebox:${id}`)) {
+            seenIds.add(`Moviebox:${id}`);
+            rawVideos.push(item);
+          }
+        }
+      }
+    } catch (e) {
+      console.warn('[Search] MovieBox search error:', e.message);
     }
 
     if (!successfulSearches) throw new Error('Pencarian gagal terhubung ke server. Silakan coba lagi.');
