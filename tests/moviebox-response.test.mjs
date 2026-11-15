@@ -1,7 +1,33 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { movieboxRequest, getMovieboxVideos, getMovieboxDiscover } from '../src/lib/moviebox.js';
+import { movieboxRequest, getMovieboxVideos, getMovieboxDiscover, getMovieboxDetail, selectEpisodeResourceId } from '../src/lib/moviebox.js';
 import { catalogItems } from '../src/lib/moviebox-tabs.js';
+
+test('series captions select the resource belonging to the requested episode', () => {
+  const items = [
+    { se: 1, ep: 2, resourceId: 'episode-2' },
+    { se: 1, ep: 3, resourceId: 'episode-3' },
+    { se: 2, ep: 3, resourceId: 'season-2-episode-3' },
+  ];
+  assert.equal(selectEpisodeResourceId(items, 1, 2, 'generic'), 'episode-2');
+  assert.equal(selectEpisodeResourceId(items, 1, 3, 'generic'), 'episode-3');
+  assert.equal(selectEpisodeResourceId(items, 2, 3, 'generic'), 'season-2-episode-3');
+  assert.equal(selectEpisodeResourceId(items, 1, 4, 'generic'), 'generic');
+});
+
+test('movie details do not invent a season or Tonton Film episode', async () => {
+  const previousFetch = globalThis.fetch;
+  globalThis.fetch = async () => Response.json({ code: 0, data: {
+    title: 'Standalone Movie', subjectType: 1, duration: '1h 30m',
+  } });
+  try {
+    const detail = await getMovieboxDetail('movie-without-seasons-test');
+    assert.equal(detail.type, 'movie');
+    assert.deepEqual(detail.seasons, []);
+  } finally {
+    globalThis.fetch = previousFetch;
+  }
+});
 
 test('upstream rejection, HTML, malformed JSON and timeouts never become empty success', async () => {
   const previousFetch = globalThis.fetch;

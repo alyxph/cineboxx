@@ -5,7 +5,7 @@ const fixture = readFileSync(new URL('../fixtures/playback.webm', import.meta.ur
 const channels = ['a', 'b', 'c'].map((id) => ({ id, title: `Channel ${id.toUpperCase()}`, modelId: 'CineTv', type: 'live' }));
 const watch = (id = 'a', live = true) => `/watch?${new URLSearchParams({ id, model_id: live ? 'CineTv' : 'Test', type: live ? 'live' : 'movie', title: live ? `Channel ${id.toUpperCase()}` : 'Test Movie' })}`;
 
-async function mockApi(page, source, { channelDelay = 0 } = {}) {
+async function mockApi(page, source, { channelDelay = 0, detail = { title: 'Test Movie', seasons: [], genres: [] } } = {}) {
   const requests = [];
   await page.route('**/api/catalog/**', async (route) => {
     const url = new URL(route.request().url());
@@ -18,7 +18,7 @@ async function mockApi(page, source, { channelDelay = 0 } = {}) {
       response.videos = channels;
       response.hasMore = false;
     }
-    if (name === 'detail') response.data = { title: 'Test Movie', seasons: [], genres: [] };
+    if (name === 'detail') response.data = detail;
     if (name === 'source') {
       const id = url.searchParams.get('id');
       requests.push(id);
@@ -138,6 +138,23 @@ test('HTTP source errors can be retried without leaving stale media state', asyn
   await expect(page.locator('.player-inline').getByRole('alert')).toHaveCount(0);
 });
 
+test('a movie that disconnects after presenting video reconnects at the same position', async ({ page }) => {
+  await mockApi(page, () => playable);
+  let mediaRequests = 0;
+  await page.route('**/api/stream?**', (route) => {
+    mediaRequests++;
+    return route.fulfill({ contentType: 'video/webm', body: fixture });
+  });
+  await page.goto(watch('midstream-recovery', false));
+  const video = page.locator('video');
+  await expect.poll(() => video.evaluate((element) => element.currentTime)).toBeGreaterThan(0.5);
+  const before = await video.evaluate((element) => element.currentTime);
+  await video.evaluate((element) => element.dispatchEvent(new Event('error')));
+  await expect.poll(() => mediaRequests).toBe(2);
+  await expect.poll(() => video.evaluate((element) => element.currentTime)).toBeGreaterThan(before);
+  await expect(page.locator('.player-inline').getByRole('alert')).toHaveCount(0);
+});
+
 test('blocked local storage does not prevent home navigation', async ({ page }) => {
   await page.addInitScript(() => {
     Storage.prototype.getItem = () => { throw new DOMException('Blocked', 'SecurityError'); };
@@ -179,4 +196,26 @@ test('subtitle sync can be delayed and remains saved for the movie', async ({ pa
   await page.reload();
   await page.getByTitle('Subtitle (CC)').click();
   await expect(page.getByRole('button', { name: /\+1\.0 dtk · Reset/ })).toBeVisible();
+});
+
+test('a movie with dubbed versions keeps the audio sidebar without fake episodes', async ({ page }) => {
+  await mockApi(page, () => playable, { detail: {
+    title: 'Street Fighter', type: 'movie', seasons: [], genres: ['Action'],
+    versions: [
+      { id: 'street', name: 'Original Audio', original: true },
+      { id: 'street-hi', name: 'Hindi dub', language: 'hi' },
+      { id: 'street-es', name: 'esla dub', language: 'esla' },
+    ],
+  } });
+  await media(page);
+  await page.goto(watch('street', false));
+  await expect(page.getByText('Audio', { exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Original' })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Hindi' })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'esla' })).toBeVisible();
+  await expect(page.getByText('Daftar Episode', { exact: true })).toHaveCount(0);
+  await expect(page.getByText('Film', { exact: true })).toBeVisible();
+  await page.getByRole('button', { name: 'Hindi' }).click();
+  await expect(page).toHaveURL(/id=street-hi/);
+  await expect(page.getByRole('button', { name: 'Hindi' })).toBeDisabled();
 });

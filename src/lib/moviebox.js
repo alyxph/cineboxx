@@ -842,7 +842,7 @@ export async function getMovieboxDetail(subjectId) {
       }
     }
 
-    if (seasons.length === 0) {
+    if (seasons.length === 0 && isSeries) {
       seasons = [
         {
           season: 1,
@@ -851,7 +851,7 @@ export async function getMovieboxDetail(subjectId) {
             {
               id: String(subjectId),
               episode: 1,
-              title: isSeries ? 'Episode 1' : 'Tonton Film',
+              title: 'Episode 1',
             },
           ],
         },
@@ -935,6 +935,17 @@ export function parseDurationToSeconds(val) {
   return total;
 }
 
+export function selectEpisodeResourceId(items, season, episode, fallback = '') {
+  if (!Array.isArray(items)) return fallback;
+  const match = items.find((item) => {
+    const itemEpisode = Number(item?.ep || item?.episode);
+    const itemSeason = Number(item?.se || 1);
+    return item?.resourceId && itemEpisode === Number(episode) &&
+      (!item?.se || itemSeason === Number(season));
+  });
+  return match ? String(match.resourceId) : fallback;
+}
+
 export async function getMovieboxSource(subjectId, episodeId = '', _depth = 0) {
   let season = 1;
   let episode = 1;
@@ -951,6 +962,7 @@ export async function getMovieboxSource(subjectId, episodeId = '', _depth = 0) {
 
   // 1. Get subject detail to discover resourceDetectors
   let resourceId = '';
+  let detailResourceId = '';
   let detail = null;
   let mediaDuration = 0;
   const streams = [];
@@ -996,7 +1008,9 @@ export async function getMovieboxSource(subjectId, episodeId = '', _depth = 0) {
     const detectors = detail.rawDetail?.resourceDetectors || [];
 
     for (const det of detectors) {
-      if (det.resourceId && !resourceId) resourceId = String(det.resourceId);
+      // A series detector can point to the first episode. Keep it only as a
+      // fallback until resource/v2 returns the selected episode's resource.
+      if (det.resourceId && !detailResourceId) detailResourceId = String(det.resourceId);
       if (det.duration && !mediaDuration) mediaDuration = parseDurationToSeconds(det.duration);
 
       // Check resolutionList in detectors if present (provides 1080p, 720p, 480p, 360p)
@@ -1050,6 +1064,9 @@ export async function getMovieboxSource(subjectId, episodeId = '', _depth = 0) {
 
     const rJson = await movieboxRequest('GET', '/wefeed-mobile-bff/subject-api/resource/v2', rParams);
     const rList = rJson?.data?.list || [];
+    resourceId = isSeries
+      ? selectEpisodeResourceId(rList, season, episode, resourceId)
+      : String(rList.find((item) => item?.resourceId)?.resourceId || resourceId);
 
     for (const item of rList) {
       const itEp = item.ep || item.episode;
@@ -1102,13 +1119,11 @@ export async function getMovieboxSource(subjectId, episodeId = '', _depth = 0) {
           validUrl.includes('.m3u8') ? 'hls' : validUrl.includes('.mpd') ? 'dash' : 'mp4'
         );
       }
-      if (!resourceId && item.resourceId) {
-        resourceId = String(item.resourceId);
-      }
     }
   } catch (e) {
     console.warn('[MovieBox] resource/v2 error:', e);
   }
+  if (!resourceId) resourceId = detailResourceId;
 
   // 3. Query play-info/v2 for DASH/HLS manifests
   try {
@@ -1316,53 +1331,21 @@ export async function getMovieboxSource(subjectId, episodeId = '', _depth = 0) {
 
     for (const cap of cList) {
       if (cap.url) {
-        subtitles.push({
+        const caption = {
           url: cap.url,
           name: cap.lanName || cap.lan || 'Subtitle',
-        });
+        };
+        // The exact episode resource is authoritative. Replace a same-language
+        // generic/sniff caption instead of retaining one from another episode.
+        const language = caption.name.trim().toLocaleLowerCase();
+        const existing = subtitles.findIndex((sub) =>
+          String(sub.name || '').trim().toLocaleLowerCase() === language);
+        if (existing >= 0) subtitles[existing] = caption;
+        else subtitles.push(caption);
       }
     }
   } catch (e) {
     console.warn('[MovieBox] get-ext-captions error:', e);
-  }
-
-  // 8. Automatic Alternative Search for Native H.264 Streams
-  // If the title is a dubbed version (e.g. [Hindi]) or only HEVC streams exist,
-  // query the original standard title to grab native H.264 streams.
-  // _depth === 0 guard prevents infinite recursion when alt source is also HEVC-only.
-  const hasDubMarker = /\[.*?\]/i.test(detail?.title || '');
-  const hasOnlyHevc = streams.length > 0 && streams.every((s) => isHevcSource(s) || s.headers?.['x-transcode']);
-
-  if (_depth === 0 && (hasDubMarker || hasOnlyHevc) && detail?.title) {
-    try {
-      const cleanTitle = detail.title.replace(/\[.*?\]|\(.*?\)/g, '').trim();
-      const shouldSearch = cleanTitle && cleanTitle.length >= 2 && (hasOnlyHevc || cleanTitle.toLowerCase() !== detail.title.toLowerCase());
-      if (shouldSearch) {
-        const altSearch = await searchMoviebox(cleanTitle);
-        const altVideo = (altSearch?.videos || []).find(
-          (v) => String(v.id) !== String(subjectId) && v.title.toLowerCase().includes(cleanTitle.toLowerCase())
-        );
-        if (altVideo) {
-          const altEpId = isSeries ? `${altVideo.id}_${season}_${episode}` : String(altVideo.id);
-          // Pass _depth + 1 so the recursive call does NOT trigger another alt-search
-          const altSrc = await getMovieboxSource(altVideo.id, altEpId, _depth + 1);
-          if (altSrc.duration && !mediaDuration) mediaDuration = altSrc.duration;
-          for (const st of altSrc.streams || []) {
-            const isAltH264 = !isHevcSource(st) && !st.headers?.['x-transcode'];
-            if (isAltH264) {
-              addStream(st.url, `${st.name}`, st.format, st.headers, 'h264');
-            }
-          }
-          for (const sub of altSrc.subtitles || []) {
-            if (sub.url && !subtitles.some((s) => s.url === sub.url || s.name === sub.name)) {
-              subtitles.push(sub);
-            }
-          }
-        }
-      }
-    } catch (altErr) {
-      console.warn('[MovieBox] Alternative source search error:', altErr.message);
-    }
   }
 
   const qualities = movieboxQualities(streams, isHlsPlaybackAvailable());

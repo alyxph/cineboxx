@@ -125,6 +125,7 @@ function PlayerSession({
   const [ended, setEnded] = useState(false);
   const failedStreams = useRef(new Set());
   const hevcDecodeFailed = useRef(false);
+  const streamRecoveryHistory = useRef(new Map());
 
 
   // Stream data
@@ -161,6 +162,7 @@ function PlayerSession({
 
   const isIframe = streamKind(selectedStream) === 'iframe';
   const isLive = isLiveVideo(video);
+  const canonicalStream = (stream) => stream?.retryOf || stream?.originalSource || stream;
 
   // Format time (seconds -> HH:MM:SS or MM:SS)
   const formatTime = (secs) => {
@@ -177,7 +179,7 @@ function PlayerSession({
 
   const failStream = useEffectEvent((message, reason = 'unavailable') => {
     const offline = navigator.onLine === false;
-    if (selectedStream) failedStreams.current.add(selectedStream.originalSource || selectedStream);
+    if (selectedStream) failedStreams.current.add(canonicalStream(selectedStream));
     const next = !offline && reason === 'unavailable'
       ? (() => {
           const available = streams.filter((stream) => !failedStreams.current.has(stream));
@@ -257,6 +259,7 @@ function PlayerSession({
     }
 
     failedStreams.current.clear();
+    streamRecoveryHistory.current.clear();
     loadedIframeUrl.current = '';
     hevcDecodeFailed.current = false;
     resumePositionRef.current = null;
@@ -367,7 +370,7 @@ function PlayerSession({
       qualityPreference.current = { ...qualityPreference.current, mode: 'manual', height: sourceResolution(source), url: source.url };
       setAutoQuality(false);
     }
-    const current = selectedStream?.originalSource || selectedStream;
+    const current = canonicalStream(selectedStream);
     if (current === source) return;
     const media = videoRef.current;
     resumePositionRef.current = media && media.readyState > 0
@@ -454,6 +457,31 @@ function PlayerSession({
       audioEl?.pause();
       failStream(message, reason);
     };
+    const recoverInterruptedSource = () => {
+      if (disposed || failed || isLive || navigator.onLine === false) return false;
+      const original = canonicalStream(selectedStream);
+      const key = `${original?.url || ''}:${sourceResolution(original)}`;
+      const now = Date.now();
+      const recent = (streamRecoveryHistory.current.get(key) || []).filter((time) => now - time < 120000);
+      if (recent.length >= 2) return false;
+      recent.push(now);
+      streamRecoveryHistory.current.set(key, recent);
+      resumePositionRef.current = videoEl.readyState > 0
+        ? videoEl.currentTime + (seekOffsetRef.current || 0)
+        : (lastTime > 0 ? lastTime + (seekOffsetRef.current || 0) : savedPos);
+      resumePausedRef.current = false;
+      failed = true;
+      hls?.stopLoad();
+      closeHlsSession();
+      videoEl.pause();
+      audioEl?.pause();
+      setError(null);
+      setLoading(true);
+      setBuffering(false);
+      setNotice('Koneksi video terputus. Menyambungkan kembali...');
+      setSelectedStream({ ...selectedStream, retryOf: original, playbackRetry: now });
+      return true;
+    };
     const play = () => {
       if (disposed || failed) return;
       videoEl.play().then(() => {
@@ -519,7 +547,7 @@ function PlayerSession({
     const fallbackHevc = () => {
       if (disposed || failed || isTranscodedMedia || !isHevcSource(selectedStream)) return false;
       hevcDecodeFailed.current = true;
-      const original = selectedStream.originalSource || selectedStream;
+      const original = canonicalStream(selectedStream);
       // Keep the selected resolution whenever a transcode worker is available.
       let next = playbackSource(original, false, true);
       if (next === original) {
@@ -545,14 +573,18 @@ function PlayerSession({
       setSelectedStream(next);
       return true;
     };
-    listen(videoEl, 'error', () => {
-      if (!hls && !shakaPlayer && videoEl.currentSrc) {
-        if (!fallbackHevc()) fail('Sumber video tidak dapat diputar.');
-      }
-    });
-    // Some decoders advance audio/time without presenting a single video frame.
+    // A presented frame proves the decoder works. Errors after this point are
+    // treated as an interrupted CDN response and resumed from the last position.
     let frameSeen = false;
     const frameCallback = videoEl.requestVideoFrameCallback?.(() => { frameSeen = true; });
+    const hasPresentedVideo = () => frameSeen || (ready && videoEl.videoWidth > 0 && lastTime > 0);
+    listen(videoEl, 'error', () => {
+      if (!hls && !shakaPlayer && videoEl.currentSrc) {
+        if (hasPresentedVideo()) {
+          if (!recoverInterruptedSource()) fail('Sumber video terputus berulang kali. Silakan coba lagi.');
+        } else if (!fallbackHevc()) fail('Sumber video tidak dapat diputar.');
+      }
+    });
     listen(videoEl, 'ended', () => {
       if (isLive) fail('Siaran telah berhenti. Mencari saluran lain.');
     });
@@ -574,7 +606,7 @@ function PlayerSession({
             if (!fallbackHevc()) fail('Gambar video gagal dimuat. Mencoba sumber lain.');
           }
         } else if (now - lastProgress >= stallLimit) {
-          fail('Siaran terhenti atau terlalu lama melakukan buffering.');
+          if (!recoverInterruptedSource()) fail('Siaran terhenti atau terlalu lama melakukan buffering.');
         }
       }
     }, 500);
@@ -683,10 +715,10 @@ function PlayerSession({
         if (isTranscodedHls) hls.on(Hls.Events.LEVEL_LOADED, (_, data) => { if (!disposed) setKnownDuration(data.details.totalduration); });
         hls.on(Hls.Events.ERROR, (_, data) => {
           if (disposed || failed || !data.fatal) return;
-          if (data.type === Hls.ErrorTypes.MEDIA_ERROR && fallbackHevc()) return;
+          if (data.type === Hls.ErrorTypes.MEDIA_ERROR && !hasPresentedVideo() && fallbackHevc()) return;
           if (data.type === Hls.ErrorTypes.MEDIA_ERROR && mediaRecoveries++ < 1) {
             hls.recoverMediaError();
-          } else fail('Sumber HLS tidak dapat diputar atau sedang offline.');
+          } else if (!recoverInterruptedSource()) fail('Sumber HLS tidak dapat diputar atau sedang offline.');
         });
         hls.attachMedia(videoEl);
         hls.loadSource(playUrl);
@@ -1498,7 +1530,7 @@ function PlayerSession({
                         <span className="text-[10px] text-gray-400 font-mono">Adaptif</span>
                       </button>
                       {streams.map((st, idx) => {
-                        const isSelected = !autoQuality && (selectedStream?.originalSource || selectedStream) === st;
+                        const isSelected = !autoQuality && canonicalStream(selectedStream) === st;
                         return (
                           <button
                             key={idx}

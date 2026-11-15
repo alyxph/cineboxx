@@ -291,7 +291,7 @@ function WatchContent() {
       detail?.type === 'series' ||
       detail?.type === 'short_drama'
     );
-  const hasSidebar = seasons.length > 0 || isLive;
+  const hasSidebar = seasons.length > 0 || versions.length > 1 || isLive;
 
   const title = detail?.title || fallbackTitle;
   const synopsis = detail?.synopsis || detail?.description || '';
@@ -714,19 +714,20 @@ function WatchContent() {
                     </div>
                   )}
 
-                  <div className="space-y-2.5">
-                    <div className="flex items-center justify-between px-1">
-                      <h2 className="text-sm font-bold text-white flex items-center gap-2">
-                        <Film className="w-4 h-4 text-[#e50914]" />
-                        <span>Daftar Episode</span>
-                      </h2>
-                      <span className="text-xs text-gray-400 font-medium">
-                        {episodes.length} Episode
-                      </span>
-                    </div>
+                  {seasons.length > 0 && (
+                    <>
+                      <div className="space-y-2.5">
+                        <div className="flex items-center justify-between px-1">
+                          <h2 className="text-sm font-bold text-white flex items-center gap-2">
+                            <Film className="w-4 h-4 text-[#e50914]" />
+                            <span>Daftar Episode</span>
+                          </h2>
+                          <span className="text-xs text-gray-400 font-medium">
+                            {episodes.length} Episode
+                          </span>
+                        </div>
 
-                    {/* Horizontal Season Tabs */}
-                    {seasons.length > 0 && (
+                        {/* Horizontal Season Tabs */}
                       <div className="flex items-center gap-2 overflow-x-auto pb-1.5 pt-0.5 scrollbar-none">
                         {seasons.map((s, idx) => {
                           const isActiveSeason = idx === selectedSeasonIdx;
@@ -745,12 +746,11 @@ function WatchContent() {
                           );
                         })}
                       </div>
-                    )}
-                  </div>
+                      </div>
 
-                  {/* Vertical List of Episodes */}
-                  <div ref={episodeListRef} className="space-y-1.5 max-h-[calc(100vh-140px)] overflow-y-auto pr-1 scrollbar-thin">
-                    {episodes.map((ep) => {
+                      {/* Vertical List of Episodes */}
+                      <div ref={episodeListRef} className="space-y-1.5 max-h-[calc(100vh-140px)] overflow-y-auto pr-1 scrollbar-thin">
+                        {episodes.map((ep) => {
                       const isActive = displayEpisode && String(displayEpisode.id) === String(ep.id);
                       const epThumbnail = ep.thumbnail || fallbackPoster || detail?.poster || '';
                       const rawEpTitle = ep.title?.trim() || '';
@@ -832,8 +832,10 @@ function WatchContent() {
                           </div>
                         </div>
                       );
-                    })}
-                  </div>
+                        })}
+                      </div>
+                    </>
+                  )}
                 </>
               )}
 
