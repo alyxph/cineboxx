@@ -389,7 +389,7 @@ function WatchContent() {
             
             {/* Main Video Player */}
             <div className="rounded-xl overflow-hidden border border-white/5 bg-black aspect-video w-full">
-              {loadingDetail && !episodeId ? <div role="status" className="h-full flex items-center justify-center text-sm text-gray-300">Memuat informasi video...</div> : <VideoPlayer
+              {loadingDetail && !episodeId && fallbackType !== 'movie' ? <div role="status" className="h-full flex items-center justify-center text-sm text-gray-300">Memuat informasi video...</div> : <VideoPlayer
                 key={`${modelId}:${id}`}
                 video={playerVideo}
                 episode={displayEpisode}

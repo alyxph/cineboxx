@@ -1074,6 +1074,7 @@ function PlayerSession({
         <>
           <video
             ref={videoRef}
+            preload="auto"
             className="w-full h-full object-contain cursor-pointer"
             onClick={(e) => {
               e.stopPropagation();

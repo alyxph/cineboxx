@@ -157,21 +157,23 @@ export async function GET(request) {
       targetUrl.toLowerCase().includes('.mpd') ||
       targetUrl.includes('mpd');
 
-    const CHUNK_SIZE = 5 * 1024 * 1024; // 5 MB chunk limit for streaming on serverless
+    const INITIAL_CHUNK_SIZE = 2 * 1024 * 1024; // 2 MB initial probe chunk for faster time-to-first-frame
+    const CHUNK_SIZE = 5 * 1024 * 1024; // 5 MB chunk limit for subsequent streaming on serverless
 
     if (range) {
       const match = range.match(/bytes=(\d+)-(\d+)?/);
       if (match) {
         const start = parseInt(match[1], 10);
         const hasEnd = Boolean(match[2]);
-        const end = hasEnd ? parseInt(match[2], 10) : start + CHUNK_SIZE - 1;
+        const size = start === 0 ? INITIAL_CHUNK_SIZE : CHUNK_SIZE;
+        const end = hasEnd ? parseInt(match[2], 10) : start + size - 1;
         headers['Range'] = `bytes=${start}-${end}`;
       } else {
         headers['Range'] = range;
       }
     } else if (!isM3u8Url && !isMpdUrl && (isMovieBox || /\.mp4($|\?)/i.test(targetUrl))) {
       // For initial MP4 probe without range, request first chunk with 206
-      headers['Range'] = `bytes=0-${CHUNK_SIZE - 1}`;
+      headers['Range'] = `bytes=0-${INITIAL_CHUNK_SIZE - 1}`;
     }
 
     let upstreamUrl = targetUrl;
