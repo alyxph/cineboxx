@@ -1,5 +1,8 @@
 import crypto from 'crypto';
 import { normalizeSources } from './playback.js';
+import { isHlsTranscodingEnabled } from './hls-transcode.js';
+import { movieboxQualities, isHevcSource } from './transcode-sources.js';
+import { tabSubjects } from './moviebox-tabs.js';
 
 const GATEWAY_SECRET_ONLINE = '76iRl07s0xSN9jqmEWAt79EBJZulIQIsV64FZr2O';
 const BASE_URL = 'https://apig.inmoviebox.com';
@@ -370,6 +373,10 @@ export function isValidMediaUrl(url = '') {
 export function getMovieboxCategories() {
   return [
     { id: 'trending', name: 'Trending' },
+    { id: 'indonesia', name: 'Indonesia' },
+    { id: 'film-indo', name: 'Film Indo' },
+    { id: 'series-indo', name: 'Series Indo' },
+    { id: 'komedi-indo', name: 'Komedi Indo' },
     { id: 'movie', name: 'Movies' },
     { id: 'tv', name: 'Series' },
     { id: 'anime', name: 'Anime' },
@@ -397,9 +404,13 @@ function mapSubjectToVideo(item) {
   const year = releaseDate ? releaseDate.slice(0, 4) : '';
   const duration = info.duration || (info.durationSeconds ? `${Math.round(info.durationSeconds / 60)}m` : '');
 
+  const title = info.title || info.name || 'Tanpa Judul';
+  const { baseTitle } = splitTitleVersion(title);
+
   return {
     id: sid,
-    title: info.title || info.name || 'Tanpa Judul',
+    title,
+    canonicalTitle: baseTitle,
     poster,
     score: score && score !== '0' ? score : 'N/A',
     releaseDate,
@@ -410,11 +421,280 @@ function mapSubjectToVideo(item) {
   };
 }
 
+const VERSION_TAGS = new Set([
+  'english', 'hindi', 'telugu', 'tamil', 'kannada', 'malayalam', 'bengali', 'urdu',
+  'punjabi', 'arabic', 'tagalog', 'indonesian', 'russian', 'kurdish', 'spanish',
+  'spanishlatam', 'portuguese', 'french', 'german', 'japanese', 'korean', 'thai',
+  'filipino', 'malay', 'vietnamese', 'chinese', 'mandarin', 'cantonese', 'italian',
+  'turkish', 'dutch', 'polish', 'esla', 'ptbr', 'original',
+]);
+
+function splitTitleVersion(title) {
+  const fullTitle = String(title || '').trim();
+  const match = fullTitle.match(/^(.*?)\s*\[([^\]]+)\]\s*$/);
+  if (!match) return { baseTitle: fullTitle, version: '' };
+
+  const version = match[2].trim();
+  const normalized = version.toLowerCase().replace(/\s+(dub|sub|audio)$/i, '').trim();
+  const isVersionTag = VERSION_TAGS.has(normalized) || /\s+(dub|sub)$/i.test(version);
+  if (!isVersionTag) return { baseTitle: fullTitle, version: '' };
+
+  return { baseTitle: match[1].trim() || fullTitle, version };
+}
+
+function collapseVariantVideos(videos) {
+  const byBaseTitle = new Map();
+  for (const video of videos || []) {
+    if (!video) continue;
+    const { baseTitle, version } = splitTitleVersion(video.title);
+    const key = baseTitle.toLowerCase();
+    const normalized = { ...video, title: baseTitle || video.title, canonicalTitle: baseTitle || video.title };
+    const existing = byBaseTitle.get(key);
+    if (!existing || (version === '' && existing.version !== '')) {
+      byBaseTitle.set(key, { ...normalized, version });
+    }
+  }
+  return Array.from(byBaseTitle.values(), ({ version, ...video }) => video);
+}
+
+/**
+ * Fetch Indonesian movies and series (filtered strictly by countryName: 'Indonesia' or language: 'Indonesian')
+ */
+export async function getIndonesianVideos(page = 1) {
+  const cacheKey = 'mb_indonesia_pool_v2';
+  const pool = await dedupe(cacheKey, async () => {
+    const cached = getCached(cacheKey);
+    if (cached) return cached;
+
+    const seeds = [
+      'Indonesia',
+      'KKN',
+      'Warkop',
+      'Dilan',
+      'Siksa',
+      'Agak Laen',
+      'The Raid',
+      'Pengantin Setan',
+      'Danur',
+      'Sewu Dino',
+      'Habibie',
+      'Gundala',
+    ];
+
+    const responses = await Promise.all(
+      seeds.map((term) =>
+        movieboxRequest('POST', '/wefeed-mobile-bff/subject-api/search/v2', {}, {
+          keyword: term,
+          page: 1,
+          perPage: 20,
+          pageSize: 20,
+          subjectType: 0,
+          type: 0,
+          q: term,
+        }).catch(() => null)
+      )
+    );
+
+    const seen = new Set();
+    const indos = [];
+
+    for (const res of responses) {
+      if (!res?.data?.results) continue;
+      for (const block of res.data.results) {
+        for (const s of (block.subjects || [])) {
+          if (!s?.subjectId || seen.has(s.subjectId)) continue;
+          const country = String(s.countryName || s.country || '').toLowerCase();
+          const lang = String(s.language || s.lang || '').toLowerCase();
+          const isMovieOrTv = [1, 2].includes(s.subjectType);
+
+          // Strictly filter for Indonesian content (countryName: 'Indonesia', language: 'Indonesian')
+          if ((country.includes('indonesia') || lang.includes('indonesian')) && isMovieOrTv) {
+            seen.add(s.subjectId);
+            indos.push(s);
+          }
+        }
+      }
+    }
+
+    // Prioritize movies (free visitor streams) over VIP series
+    indos.sort((a, b) => (b.subjectType === 1 ? 1 : 0) - (a.subjectType === 1 ? 1 : 0));
+
+    const mapped = collapseVariantVideos(indos.map(mapSubjectToVideo).filter(Boolean));
+    if (mapped.length > 0) {
+      setCached(cacheKey, mapped, 600); // Cache pool for 10 minutes
+    }
+    return mapped;
+  });
+
+  const perPage = 20;
+  const startIndex = (page - 1) * perPage;
+  const pageVideos = pool.slice(startIndex, startIndex + perPage);
+  const hasMore = startIndex + perPage < pool.length;
+
+  return {
+    videos: pageVideos,
+    page,
+    hasMore,
+  };
+}
+
+const DISCOVER_CATEGORY_FILTERS = {
+  'film-indo': { subjectType: 1, country: 'Indonesia', language: 'Indonesian', sort: 'Latest' },
+  'series-indo': { subjectType: 2, country: 'Indonesia', language: 'Indonesian', sort: 'Latest' },
+  'komedi-indo': { subjectType: 1, country: 'Indonesia', genre: 'Comedy', language: 'Indonesian', sort: 'Latest' },
+  'movie': { subjectType: 1, sort: 'Trending' },
+  'tv': { subjectType: 2, sort: 'Trending' },
+  'anime': { genre: 'Anime', sort: 'ForYou' },
+  'western': { country: 'United States', sort: 'ForYou' },
+};
+
+/**
+ * Fetch Asian movies and series (Korea, China, Thailand, Japan)
+ */
+export async function getAsianVideos(page = 1) {
+  const cacheKey = `mb_asian_pool_v2_${page}`;
+  return dedupe(cacheKey, async () => {
+    const cached = getCached(cacheKey);
+    if (cached) return cached;
+
+    const countries = ['Korea', 'China', 'Thailand', 'Japan'];
+    const responses = await Promise.all(
+      countries.map((c) =>
+        movieboxRequest('POST', '/wefeed-mobile-bff/subject-api/list', {}, {
+          subjectType: 0,
+          country: c,
+          sort: 'ForYou',
+          page,
+          perPage: 10,
+        }).catch(() => null)
+      )
+    );
+
+    const seen = new Set();
+    const items = [];
+
+    for (const res of responses) {
+      for (const item of (res?.data?.items || [])) {
+        if (!item?.subjectId || seen.has(item.subjectId)) continue;
+        if (![1, 2].includes(Number(item.subjectType))) continue;
+        seen.add(item.subjectId);
+        items.push(item);
+      }
+    }
+
+    const videos = collapseVariantVideos(items.map(mapSubjectToVideo).filter(Boolean));
+    const result = {
+      videos,
+      page,
+      hasMore: videos.length >= 10,
+    };
+
+    if (videos.length > 0) {
+      setCached(cacheKey, result, 300);
+    }
+    return result;
+  });
+}
+
+/**
+ * Fetch titles using MovieBox list filters (country, genre, language, subject type)
+ */
+export async function getMovieboxDiscover({
+  subjectType = 0,
+  country = '',
+  genre = '',
+  language = '',
+  sort = 'ForYou',
+  page = 1,
+  perPage = 20,
+} = {}) {
+  const safePerPage = Math.min(Math.max(Number(perPage) || 20, 1), 20);
+  const cacheKey = `mb_discover_v2_${subjectType}_${country}_${genre}_${language}_${sort}_${page}_${safePerPage}`.toLowerCase();
+  return dedupe(cacheKey, async () => {
+    const cached = getCached(cacheKey);
+    if (cached) return cached;
+
+    const payload = {
+      page,
+      perPage: safePerPage,
+      subjectType: Number(subjectType) || 0,
+      sort,
+    };
+    if (country) payload.country = country;
+    if (genre) payload.genre = genre;
+
+    const json = await movieboxRequest('POST', '/wefeed-mobile-bff/subject-api/list', {}, payload);
+    const rawItems = json?.data?.items || [];
+    const languageNeedle = String(language).trim().toLowerCase();
+
+    const filtered = rawItems.filter((item) => {
+      if (![1, 2].includes(Number(item?.subjectType))) return false;
+      if (!languageNeedle) return true;
+      const itemLanguage = String(item?.language || '').trim().toLowerCase();
+      return !itemLanguage || itemLanguage.includes(languageNeedle);
+    });
+
+    const seenIds = new Set();
+    const uniqueVideos = [];
+    for (const item of filtered) {
+      const video = mapSubjectToVideo(item);
+      if (!video || seenIds.has(video.id)) continue;
+      seenIds.add(video.id);
+      uniqueVideos.push(video);
+    }
+    const videos = collapseVariantVideos(uniqueVideos);
+    const pager = json?.data?.pager || {};
+    const hasMore = pager.hasMore !== undefined
+      ? Boolean(pager.hasMore)
+      : rawItems.length >= safePerPage;
+
+    const result = { videos, page, hasMore };
+    if (videos.length > 0) {
+      setCached(cacheKey, result, 300);
+    }
+    return result;
+  });
+}
+
 /**
  * Fetch video list for a category
  */
 export async function getMovieboxVideos({ categoryId = 'trending', page = 1 } = {}) {
-  const cacheKey = `mb_videos_${categoryId}_${page}`;
+  if (categoryId === 'kids') {
+    const kidsCacheKey = `mb_kids_tab23_v1_${page}`;
+    return dedupe(kidsCacheKey, async () => {
+      const json = await movieboxRequest('GET', '/wefeed-mobile-bff/tab-operating', {
+        tabId: 23, page, pageSize: 50,
+      });
+      if (json?.code !== undefined && ![0, 200].includes(Number(json.code))) {
+        throw new Error('Kategori Kids sedang tidak tersedia.');
+      }
+      const titles = tabSubjects(json?.data);
+      const seen = new Set();
+      const videos = collapseVariantVideos(titles.map(mapSubjectToVideo).filter((video) => {
+        if (!video || seen.has(video.id)) return false;
+        seen.add(video.id);
+        return true;
+      }));
+      const result = { videos, page, hasMore: json?.data?.pager?.hasMore !== undefined
+        ? Boolean(json.data.pager.hasMore) : titles.length >= 50 };
+      if (videos.length) setCached(kidsCacheKey, result, 300);
+      return result;
+    });
+  }
+  if (categoryId === 'indonesia') {
+    return getIndonesianVideos(page);
+  }
+  if (categoryId === 'asian') {
+    return getAsianVideos(page);
+  }
+
+  const discoverFilter = DISCOVER_CATEGORY_FILTERS[categoryId];
+  if (discoverFilter) {
+    return getMovieboxDiscover({ ...discoverFilter, page });
+  }
+
+  const cacheKey = `mb_videos_v6_${categoryId}_${page}`;
   return dedupe(cacheKey, async () => {
     const cached = getCached(cacheKey);
     if (cached) return cached;
@@ -426,7 +706,6 @@ export async function getMovieboxVideos({ categoryId = 'trending', page = 1 } = 
       anime: 'anime',
       asian: 'asian',
       western: 'western',
-      kids: 'kids',
     };
 
     const type = catMap[categoryId] || 'trending';
@@ -437,7 +716,17 @@ export async function getMovieboxVideos({ categoryId = 'trending', page = 1 } = 
     });
 
     const rawList = json?.data?.list || [];
-    const videos = rawList.map(mapSubjectToVideo).filter(Boolean);
+    const popularity = (item) => {
+      const value = (item?.info || item?.subject || item)?.popularity;
+      return value !== null && value !== undefined && value !== '' ? Number(value) : NaN;
+    };
+    // Use explicit popularity scores when supplied. Otherwise keep the provider's
+    // Trending ranking, without substituting IMDb ratings or movie/series priority.
+    const rankedList = type === 'trending' && rawList.every((item) => Number.isFinite(popularity(item)))
+      ? [...rawList].sort((a, b) => popularity(b) - popularity(a))
+      : rawList;
+    const videos = collapseVariantVideos(rankedList.map(mapSubjectToVideo).filter(Boolean));
+
     const hasMore = rawList.length >= 24;
 
     const result = { videos, page, hasMore };
@@ -452,7 +741,7 @@ export async function getMovieboxVideos({ categoryId = 'trending', page = 1 } = 
  * Fetch movie or series detail
  */
 export async function getMovieboxDetail(subjectId) {
-  const cacheKey = `mb_detail_${subjectId}`;
+  const cacheKey = `mb_detail_v3_${subjectId}`;
   return dedupe(cacheKey, async () => {
     const cached = getCached(cacheKey);
     if (cached) return cached;
@@ -516,18 +805,44 @@ export async function getMovieboxDetail(subjectId) {
 
     const poster = data.cover?.url || data.poster?.url || data.stills?.url || '';
     const score = String(data.imdbRatingValue || data.score || '');
+    const titleInfo = splitTitleVersion(data.title);
+
+    const versions = [];
+    const seenVersionIds = new Set();
+    for (const dub of Array.isArray(data.dubs) ? data.dubs : []) {
+      const versionId = String(dub?.subjectId || '');
+      if (!versionId || seenVersionIds.has(versionId)) continue;
+      seenVersionIds.add(versionId);
+      versions.push({
+        id: versionId,
+        name: String(dub.lanName || dub.lanCode || 'Versi'),
+        language: String(dub.lanCode || ''),
+        original: Boolean(dub.original),
+      });
+    }
+    if (versions.length === 0) {
+      versions.push({
+        id: String(subjectId),
+        name: 'Original Audio',
+        language: '',
+        original: true,
+      });
+    }
 
     const result = {
       id: String(subjectId),
-      title: data.title,
+      title: titleInfo.baseTitle || data.title,
       description: data.description || '',
       poster,
       score: score && score !== '0' ? score : 'N/A',
       releaseDate: data.releaseDate || '',
       genre: data.genre || '',
+      duration: data.duration || '',
+      durationSeconds: Number(data.durationSeconds) || 0,
       type: isSeries ? 'tv' : 'movie',
       modelId: 'Moviebox',
       seasons,
+      versions,
       rawDetail: data,
     };
 
@@ -539,6 +854,21 @@ export async function getMovieboxDetail(subjectId) {
 /**
  * Resolve streaming playback sources and subtitles for MovieBox
  */
+export function parseDurationToSeconds(val) {
+  if (!val) return 0;
+  if (typeof val === 'number') return val > 0 ? val : 0;
+  const str = String(val).trim();
+  if (/^\d+$/.test(str)) return Number(str);
+  let total = 0;
+  const h = str.match(/(\d+)\s*h/i);
+  const m = str.match(/(\d+)\s*(m|min)/i);
+  const s = str.match(/(\d+)\s*s/i);
+  if (h) total += parseInt(h[1], 10) * 3600;
+  if (m) total += parseInt(m[1], 10) * 60;
+  if (s) total += parseInt(s[1], 10);
+  return total;
+}
+
 export async function getMovieboxSource(subjectId, episodeId = '') {
   let season = 1;
   let episode = 1;
@@ -555,45 +885,82 @@ export async function getMovieboxSource(subjectId, episodeId = '') {
 
   // 1. Get subject detail to discover resourceDetectors
   let resourceId = '';
+  let detail = null;
+  let mediaDuration = 0;
   const streams = [];
   const subtitles = [];
+  const seenUrls = new Set();
+
+  const addStream = (url, name, format, customHeaders = null) => {
+    if (!url) return;
+    // Reject dummy preview/sample placeholder files (< 1MB samples)
+    if (url.includes('macdn.aoneroom.com/other/') || url.includes('80da52722ee7de7a4303290af6783424')) {
+      return;
+    }
+
+    const key = url + (customHeaders?.['x-transcode'] || '');
+    if (seenUrls.has(key)) return;
+    seenUrls.add(key);
+
+    const streamHeaders = customHeaders || {
+      'User-Agent': 'MovieBox/4.0.02 (Android 14; Pixel 6)',
+    };
+
+    streams.push({
+      url,
+      name,
+      format,
+      headers: streamHeaders,
+    });
+  };
 
   try {
-    const detail = await getMovieboxDetail(subjectId);
+    detail = await getMovieboxDetail(subjectId);
     if (detail.type === 'tv') isSeries = true;
+    if (!mediaDuration) {
+      if (detail.rawDetail?.durationSeconds && Number(detail.rawDetail.durationSeconds) > 0) {
+        mediaDuration = Number(detail.rawDetail.durationSeconds);
+      } else if (detail.rawDetail?.duration) {
+        mediaDuration = parseDurationToSeconds(detail.rawDetail.duration);
+      }
+    }
     const detectors = detail.rawDetail?.resourceDetectors || [];
 
     for (const det of detectors) {
       if (det.resourceId && !resourceId) resourceId = String(det.resourceId);
-      
-      // Check direct downloadUrl (Never use webpage resourceLink as media stream)
-      if (isValidMediaUrl(det.downloadUrl)) {
-        streams.push({
-          url: det.downloadUrl,
-          name: det.codecName ? `Direct MP4 (${det.codecName.toUpperCase()})` : 'Direct MP4',
-          format: 'mp4',
-        });
-      }
+      if (det.duration && !mediaDuration) mediaDuration = parseDurationToSeconds(det.duration);
 
-      // Check resolutionList in detectors if present
+      // Check resolutionList in detectors if present (provides 1080p, 720p, 480p, 360p)
       if (Array.isArray(det.resolutionList)) {
         for (const rItem of det.resolutionList) {
-          const rUrl = rItem.downloadUrl || rItem.url || '';
+          const rUrl = rItem.resourceLink || rItem.downloadUrl || rItem.url || '';
           if (isValidMediaUrl(rUrl)) {
-            streams.push({
-              url: rUrl,
-              name: rItem.resolution ? `${rItem.resolution}p` : 'HD',
-              format: rUrl.includes('.m3u8') ? 'hls' : rUrl.includes('.mpd') ? 'dash' : 'mp4',
-            });
+            const resLabel = rItem.resolution ? `${rItem.resolution}p` : 'HD';
+            const codecLabel = rItem.codecName ? ` (${rItem.codecName.toUpperCase()})` : '';
+            addStream(
+              rUrl,
+              `${resLabel}${codecLabel}`,
+              rUrl.includes('.m3u8') ? 'hls' : rUrl.includes('.mpd') ? 'dash' : 'mp4'
+            );
           }
         }
+      }
+
+      // Check direct downloadUrl
+      if (isValidMediaUrl(det.downloadUrl)) {
+        const codecLabel = det.codecName ? ` (${det.codecName.toUpperCase()})` : '';
+        addStream(
+          det.downloadUrl,
+          `Direct MP4${codecLabel}`,
+          'mp4'
+        );
       }
     }
   } catch (e) {
     console.warn('[MovieBox] Failed to inspect resourceDetectors:', e);
   }
 
-  // 2. Query resource/v2 with isVip=true spoofing
+  // 2. Query resource/v2 with isVip=true spoofing & cloud sniffing
   try {
     const rParams = {
       subjectId,
@@ -616,16 +983,55 @@ export async function getMovieboxSource(subjectId, episodeId = '') {
     const rList = rJson?.data?.list || [];
 
     for (const item of rList) {
-      const candidates = [item.downloadUrl, item.url, item.resourceLink];
+      const itEp = item.ep || item.episode;
+      const itSe = item.se || 1;
+      const matchEp = !isSeries || Number(itEp) === episode;
+      const matchSe = !isSeries || !item.se || Number(itSe) === season;
+      if (!matchEp || !matchSe) continue;
+
+      if (item.duration && !mediaDuration) {
+        mediaDuration = Number(item.duration);
+      }
+
+      // If item has sourceUrl, it is a cloud stream that must be sniffed to obtain the real full video
+      if (item.sourceUrl) {
+        try {
+          const sniff = await movieboxRequest('GET', '/wefeed-mobile-bff/sniff/config', {
+            linkUrl: item.sourceUrl,
+            subjectId,
+          });
+          const dlUrl = sniff?.data?.downloadUrl;
+          if (isValidMediaUrl(dlUrl)) {
+            const res = sniff.data?.resource?.resolution || item.resolution || 720;
+            const codec = sniff.data?.resource?.codecName || item.codecName || 'h264';
+            const dSec = Number(sniff.data?.resource?.duration || item.duration || 0);
+            if (dSec > 0 && !mediaDuration) mediaDuration = dSec;
+            addStream(dlUrl, `${res}p (${codec.toUpperCase()})`, 'mp4');
+
+            for (const cap of sniff.data?.resource?.extCaptions || []) {
+              if (cap.url) {
+                subtitles.push({
+                  url: cap.url,
+                  name: cap.lanName || cap.lan || 'Subtitle',
+                });
+              }
+            }
+          }
+        } catch (se) {
+          console.warn('[MovieBox] Sniff from resource/v2 failed:', se.message);
+        }
+      }
+
+      const candidates = [item.resourceLink, item.downloadUrl, item.url];
       const validUrl = candidates.find((u) => isValidMediaUrl(u));
       if (validUrl) {
         const resLabel = item.resolution ? `${item.resolution}p` : 'HD';
-        const codecLabel = item.codecName ? ` - ${item.codecName.toUpperCase()}` : '';
-        streams.push({
-          url: validUrl,
-          name: `${resLabel}${codecLabel}`,
-          format: validUrl.includes('.m3u8') ? 'hls' : validUrl.includes('.mpd') ? 'dash' : 'mp4',
-        });
+        const codecLabel = item.codecName ? ` (${item.codecName.toUpperCase()})` : '';
+        addStream(
+          validUrl,
+          `${resLabel}${codecLabel}`,
+          validUrl.includes('.m3u8') ? 'hls' : validUrl.includes('.mpd') ? 'dash' : 'mp4'
+        );
       }
       if (!resourceId && item.resourceId) {
         resourceId = String(item.resourceId);
@@ -644,16 +1050,21 @@ export async function getMovieboxSource(subjectId, episodeId = '') {
     }
 
     const pJson = await movieboxRequest('GET', '/wefeed-mobile-bff/subject-api/play-info/v2', playParams);
+    if (pJson?.data?.duration && !mediaDuration) {
+      mediaDuration = Number(pJson.data.duration);
+    }
     const pStreams = pJson?.data?.streams || pJson?.data?.streamList || [];
 
     for (const st of pStreams) {
       const stUrl = st.url || '';
       if (isValidMediaUrl(stUrl)) {
-        streams.push({
-          url: stUrl,
-          name: st.resolutions ? `${st.resolutions}p` : 'Auto',
-          format: st.format?.toLowerCase() || 'mp4',
-        });
+        const resLabel = st.resolutions ? `${st.resolutions}p` : 'Auto';
+        const codecLabel = st.codecName ? ` (${st.codecName.toUpperCase()})` : '';
+        addStream(
+          stUrl,
+          `${resLabel}${codecLabel}`,
+          st.format?.toLowerCase() || 'mp4'
+        );
       }
 
       // Check for hidden signed cookie base64 urlprefix
@@ -663,18 +1074,8 @@ export async function getMovieboxSource(subjectId, episodeId = '') {
           const b64 = signCookie.split('urlprefix=')[1].split(';')[0];
           const basePath = Buffer.from(b64, 'base64').toString('utf8');
           if (basePath.startsWith('http')) {
-            streams.push({
-              url: `${basePath}index.mpd`,
-              name: 'DASH Manifest',
-              format: 'dash',
-              headers: { 'Referer': 'https://sportslive.wine' },
-            });
-            streams.push({
-              url: `${basePath}index.m3u8`,
-              name: 'HLS Stream',
-              format: 'hls',
-              headers: { 'Referer': 'https://sportslive.wine' },
-            });
+            addStream(`${basePath}index.m3u8`, 'HLS Stream', 'hls');
+            addStream(`${basePath}index.mpd`, 'DASH Manifest', 'dash');
           }
         } catch {}
       }
@@ -707,11 +1108,13 @@ export async function getMovieboxSource(subjectId, episodeId = '') {
       for (const lst of legStreams) {
         const lUrl = lst.url || '';
         if (isValidMediaUrl(lUrl)) {
-          streams.push({
-            url: lUrl,
-            name: lst.resolutions ? `${lst.resolutions}p` : 'Auto',
-            format: lst.format?.toLowerCase() || 'mp4',
-          });
+          const resLabel = lst.resolutions ? `${lst.resolutions}p` : 'Auto';
+          const codecLabel = lst.codecName ? ` (${lst.codecName.toUpperCase()})` : '';
+          addStream(
+            lUrl,
+            `${resLabel}${codecLabel}`,
+            lst.format?.toLowerCase() || 'mp4'
+          );
         }
       }
     } catch (le) {
@@ -719,7 +1122,120 @@ export async function getMovieboxSource(subjectId, episodeId = '') {
     }
   }
 
-  // 5. External Captions from get-ext-captions
+  // 5. Cloud Sniffer Engine (/sniff/config) - Bypasses VIP restrictions for TV series and movies
+  if (streams.length === 0) {
+    try {
+      const targetEp = isSeries ? episode : 1;
+      const targetSe = isSeries ? season : 1;
+      const sniffPage = Math.max(0, Math.floor((targetEp - 1) / 20));
+
+      const pagesToTry = [sniffPage];
+      if (sniffPage > 0) pagesToTry.push(sniffPage - 1);
+      pagesToTry.push(sniffPage + 1);
+
+      for (const p of pagesToTry) {
+        if (streams.length > 0) break;
+        const resRaw = await movieboxRequest('GET', '/wefeed-mobile-bff/subject-api/resource', {
+          subjectId,
+          page: p,
+          perPage: 20,
+          pagerMode: 0,
+        });
+        const resItems = resRaw?.data?.list || resRaw?.data?.items || [];
+        if (resItems.length === 0 && p > sniffPage) break;
+
+        for (const it of resItems) {
+          const itEp = it.ep || it.episode;
+          const itSe = it.se || 1;
+          const matchEp = !isSeries || Number(itEp) === targetEp;
+          const matchSe = !isSeries || !it.se || Number(itSe) === targetSe;
+
+          if (matchEp && matchSe) {
+            const link = it.sourceUrl || it.resourceLink;
+            if (link) {
+              try {
+                const sniff = await movieboxRequest('GET', '/wefeed-mobile-bff/sniff/config', {
+                  linkUrl: link,
+                  subjectId,
+                });
+                const dlUrl = sniff?.data?.downloadUrl;
+                if (isValidMediaUrl(dlUrl)) {
+                  const res = sniff.data?.resource?.resolution || it.resolution || 720;
+                  const codec = sniff.data?.resource?.codecName || it.codecName || 'h264';
+                  const dSec = Number(sniff.data?.resource?.duration || it.duration || 0);
+                  if (dSec > 0 && !mediaDuration) mediaDuration = dSec;
+                  addStream(dlUrl, `${res}p (${codec.toUpperCase()})`, 'mp4');
+
+                  // Collect subtitles if provided in sniff response
+                  const extCaps = sniff.data?.resource?.extCaptions || [];
+                  for (const cap of extCaps) {
+                    if (cap.url) {
+                      subtitles.push({
+                        url: cap.url,
+                        name: cap.lanName || cap.lan || 'Subtitle',
+                      });
+                    }
+                  }
+                }
+              } catch (se) {
+                console.warn('[MovieBox] Sniffer call failed:', se.message);
+              }
+            }
+          }
+        }
+      }
+    } catch (e) {
+      console.warn('[MovieBox] Sniffer engine error:', e);
+    }
+  }
+
+  // 6. UGC Collection Mirror Engine (/ugc/...) - Community mirror fallback
+  if (streams.length === 0) {
+    try {
+      const targetEp = isSeries ? episode : 1;
+      const ugcFirst = await movieboxRequest('GET', '/wefeed-mobile-bff/ugc/video/first-by-subject', { subjectId });
+      const collId = ugcFirst?.data?.belongToCollection?.collectionId;
+
+      if (collId) {
+        const ugcPage = Math.max(1, Math.floor((targetEp - 1) / 50) + 1);
+        const pagesToTry = [ugcPage];
+        if (ugcPage > 1) pagesToTry.push(ugcPage - 1);
+        pagesToTry.push(ugcPage + 1);
+
+        for (const p of pagesToTry) {
+          if (streams.length > 0) break;
+          const dlList = await movieboxRequest('GET', '/wefeed-mobile-bff/ugc/collection/download-list', {
+            collectionId: collId,
+            page: p,
+            perPage: 50,
+          });
+          const items = dlList?.data?.items || [];
+          if (items.length === 0 && p > ugcPage) break;
+
+          for (const it of items) {
+            const ep = it.episode || it.ep || it.order;
+            const epTitle = String(it.epTitle || it.title || '');
+            const matchEp = !isSeries || Number(ep) === targetEp || epTitle.includes(`EP${targetEp}`) || epTitle.includes(`E${targetEp}`);
+
+            if (matchEp) {
+              const resources = it.resources || [];
+              for (const r of resources) {
+                if (isValidMediaUrl(r.url)) {
+                  const res = r.resolution || 720;
+                  const codec = r.codecName ? ` (${r.codecName.toUpperCase()})` : '';
+                  addStream(r.url, `${res}p${codec}`, 'mp4');
+                }
+              }
+            }
+          }
+        }
+      }
+    } catch (e) {
+      console.warn('[MovieBox] UGC engine error:', e);
+    }
+  }
+
+  // 7. External Captions from get-ext-captions
   try {
     const capParams = {
       resourceId: resourceId || subjectId,
@@ -741,15 +1257,53 @@ export async function getMovieboxSource(subjectId, episodeId = '') {
     console.warn('[MovieBox] get-ext-captions error:', e);
   }
 
+  // 8. Automatic Alternative Search for Native H.264 Streams
+  // If the title is a dubbed version (e.g. [Hindi]) or only HEVC streams exist,
+  // query the original standard title to grab native H.264 streams
+  const hasDubMarker = /\[.*?\]/i.test(detail?.title || '');
+  const hasOnlyHevc = streams.every((s) => /hevc|h265/i.test(s.name) || s.headers?.['x-transcode']);
+
+  if ((hasDubMarker || hasOnlyHevc) && detail?.title) {
+    try {
+      const cleanTitle = detail.title.replace(/\[.*?\]|\(.*?\)/g, '').trim();
+      if (cleanTitle && cleanTitle.length >= 2 && cleanTitle.toLowerCase() !== detail.title.toLowerCase()) {
+        const altSearch = await searchMoviebox(cleanTitle);
+        const altVideo = (altSearch?.videos || []).find(
+          (v) => String(v.id) !== String(subjectId) && v.title.toLowerCase().includes(cleanTitle.toLowerCase())
+        );
+        if (altVideo) {
+          const altEpId = isSeries ? `${altVideo.id}_${season}_${episode}` : String(altVideo.id);
+          const altSrc = await getMovieboxSource(altVideo.id, altEpId);
+          if (altSrc.duration && !mediaDuration) mediaDuration = altSrc.duration;
+          for (const st of altSrc.streams || []) {
+            const isAltH264 = !isHevcSource(st) && !st.headers?.['x-transcode'];
+            if (isAltH264) {
+              addStream(st.url, `${st.name} (Versi Standar)`, st.format, st.headers);
+            }
+          }
+        }
+      }
+    } catch (altErr) {
+      console.warn('[MovieBox] Alternative source search error:', altErr.message);
+    }
+  }
+
+  const qualities = movieboxQualities(streams, isHlsTranscodingEnabled());
+
   if (streams.length === 0) {
     throw new Error(
-      'Sumber video untuk judul/episode ini memerlukan akun MovieBox atau sedang dibatasi oleh MovieBox. Silakan pilih judul lain (seperti Avatar, Rocket Singh, dsb) atau pasang akun MOVIEBOX_TOKEN di .env.local.'
+      'Sumber video untuk judul ini sedang tidak tersedia atau mengalami pembatasan tautan oleh MovieBox. Silakan coba judul atau episode lainnya.'
     );
   }
 
+  if (!mediaDuration || mediaDuration <= 0) {
+    mediaDuration = isSeries ? 45 * 60 : 90 * 60;
+  }
+
   return normalizeSources({
-    streams,
+    streams: qualities,
     subtitles,
+    duration: mediaDuration || 0,
   });
 }
 
@@ -762,7 +1316,7 @@ export async function searchMoviebox(query, page = 1) {
   }
 
   const cleanQ = query.trim();
-  const cacheKey = `mb_search_${cleanQ}_${page}`;
+  const cacheKey = `mb_search_v2_${cleanQ}_${page}`;
   return dedupe(cacheKey, async () => {
     const cached = getCached(cacheKey);
     if (cached) return cached;
@@ -791,7 +1345,8 @@ export async function searchMoviebox(query, page = 1) {
       subjects.push(...json.data.list);
     }
 
-    const videos = subjects.map(mapSubjectToVideo).filter(Boolean);
+    const videos = collapseVariantVideos(subjects.map(mapSubjectToVideo).filter(Boolean));
+
     const hasMore = videos.length >= 20;
 
     const result = { videos, page, hasMore };

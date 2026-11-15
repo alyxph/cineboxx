@@ -1,6 +1,6 @@
 # 🎬 CineBox Web
 
-Aplikasi web streaming film dan serial TV modern berbasis Next.js 16 (App Router), terintegrasi langsung dengan API CineFlow dan siap dideploy langsung ke **Vercel** tanpa konfigurasi server tambahan.
+Aplikasi web streaming film dan serial TV modern berbasis Next.js 16 (App Router), terintegrasi langsung dengan API CineFlow. Transcode HLS untuk sumber HEVC memerlukan server Node/Docker persisten; lihat [panduan HLS](docs/hls-transcode.md).
 
 ---
 
@@ -55,7 +55,7 @@ npm run start
 
 ## 🚀 Panduan Deploy ke Vercel (Gratis)
 
-Proyek ini 100% kompatibel dengan **Vercel Serverless Functions**.
+Sumber native dan proxy dapat menggunakan **Vercel Serverless Functions**. Transcode HLS HEVC dinonaktifkan pada Vercel karena sesi ffmpeg dan cache segmen memerlukan server persisten. Gunakan deployment Node/Docker untuk fitur tersebut; lihat [konfigurasi dan batasannya](docs/hls-transcode.md).
 
 ### Cara 1: Lewat Web Dashboard Vercel (Paling Mudah)
 1. Buat repositori baru di akun GitHub Anda (misal: `cineboxweb`).

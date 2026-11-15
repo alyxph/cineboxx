@@ -2,6 +2,7 @@
 
 import { useState, useEffect, useRef, useCallback, useEffectEvent } from 'react';
 import Hls from 'hls.js';
+import { browserSupportsHevc, isHevcSource, playbackSource } from '@/lib/transcode-sources';
 import {
   Play,
   Pause,
@@ -21,11 +22,46 @@ import {
   PictureInPicture2,
   RadioOff,
   Tv,
+  Film,
+  X,
 } from 'lucide-react';
 import { saveProgress, getProgress } from '@/lib/storage';
 import { fetchJson } from '@/lib/http';
-import { isLiveVideo, streamKind, proxyUrl, normalizeSources, LIVE_SOURCE_TIMEOUT, LIVE_START_TIMEOUT, LIVE_STALL_TIMEOUT } from '@/lib/playback';
+import { isLiveVideo, streamKind, proxyUrl, normalizeSources, createHlsSessionId, LIVE_SOURCE_TIMEOUT, LIVE_START_TIMEOUT, LIVE_STALL_TIMEOUT } from '@/lib/playback';
 import { parseSubtitleText } from '@/lib/subtitles';
+
+const RECOMMENDED_MOVIES = [
+  {
+    id: '5390197429792821032',
+    title: 'Titanic',
+    poster: 'https://pbcdn.aoneroom.com/image/2026/01/27/230959ee38bcae528aa8e9cff532d603.jpg',
+  },
+  {
+    id: '1654274595068805784',
+    title: 'Avatar',
+    poster: 'https://pbcdn.aoneroom.com/image/2026/01/27/d0afc578a156ad5e2f754fc36081da26.jpg',
+  },
+  {
+    id: '6027841441853048416',
+    title: 'John Wick',
+    poster: 'https://pbcdn.aoneroom.com/image/2026/01/27/e780c98f8245ea378875560936fef95b.jpg',
+  },
+  {
+    id: '8328377108439386184',
+    title: 'Iron Man',
+    poster: 'https://pbcdn.aoneroom.com/image/2026/01/27/9064821a81dc1c2573f084ba68c3ea6f.jpg',
+  },
+  {
+    id: '977486567826752424',
+    title: 'Inception',
+    poster: 'https://pbcdn.aoneroom.com/image/2026/01/27/ca253372223725b74b1e5ec6042db5ae.jpg',
+  },
+  {
+    id: '1007576544987988816',
+    title: 'Spider-Man',
+    poster: 'https://pbcdn.aoneroom.com/image/2023/08/11/ff7e28b18536cfdb575dfa5e5520fe48.jpg',
+  },
+];
 
 function base64UrlToHex(base64Url) {
   if (!base64Url || typeof base64Url !== 'string') return '';
@@ -82,10 +118,13 @@ function PlayerSession({
   const [buffering, setBuffering] = useState(false);
   const [error, setError] = useState(null);
   const [isChannelOffline, setIsChannelOffline] = useState(false);
+  const resumePositionRef = useRef(null);
+
   const [notice, setNotice] = useState('');
   const [episodeBanner, setEpisodeBanner] = useState(null);
   const [ended, setEnded] = useState(false);
   const failedStreams = useRef(new Set());
+
 
   // Stream data
   const [streams, setStreams] = useState([]);
@@ -99,6 +138,8 @@ function PlayerSession({
   const [isPlaying, setIsPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
+  const [knownDuration, setKnownDuration] = useState(0);
+  const seekOffsetRef = useRef(0);
   const [volume, setVolume] = useState(1);
   const [isMuted, setIsMuted] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState(false);
@@ -129,7 +170,7 @@ function PlayerSession({
 
   const failStream = useEffectEvent((message, reason = 'unavailable') => {
     const offline = navigator.onLine === false;
-    if (selectedStream) failedStreams.current.add(selectedStream);
+    if (selectedStream) failedStreams.current.add(selectedStream.originalSource || selectedStream);
     const next = !offline && reason === 'unavailable'
       ? streams.find((stream) => !failedStreams.current.has(stream))
       : null;
@@ -137,7 +178,7 @@ function PlayerSession({
       setNotice('Sumber bermasalah. Mencoba sumber video lain...');
       setLoading(true);
       setBuffering(false);
-      setSelectedStream(next);
+      setSelectedStream(playbackSource(next, browserSupportsHevc(videoRef.current)));
       return;
     }
     const info = offline ? 'Koneksi internet terputus. Hubungkan kembali lalu tekan Coba Lagi.' : message;
@@ -181,9 +222,7 @@ function PlayerSession({
     }, 6000);
   });
 
-  // Each content/retry has its own mounted session; keep container & video mounted across episodes so fullscreen stays active.
-  useEffect(() => {
-    const controller = new AbortController();
+  const resetForSource = useEffectEvent(() => {
     const isEpisodeSwitch =
       prevEpisodeIdRef.current != null &&
       episode?.id != null &&
@@ -196,22 +235,34 @@ function PlayerSession({
 
     failedStreams.current.clear();
     loadedIframeUrl.current = '';
+    resumePositionRef.current = null;
     setLoading(true);
     setBuffering(false);
     setError(null);
     setIsChannelOffline(false);
+
+
     setNotice('');
     setEnded(false);
     setIsPlaying(false);
     setCurrentTime(0);
     setDuration(0);
+    setKnownDuration(0);
+    seekOffsetRef.current = 0;
     setStreams([]);
     setSelectedStream(null);
     setSubtitles([]);
     setSelectedSubtitle(null);
     setSubtitleCues([]);
     setCurrentSubtitleText('');
+  });
 
+  // Keep the media element mounted across episodes so fullscreen stays active.
+  useEffect(() => {
+    const controller = new AbortController();
+    // Reset on an episode/retry boundary while retaining the fullscreen media DOM.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    resetForSource();
     async function loadSource() {
       try {
         const params = new URLSearchParams({ model_id: video.modelId, id: video.id });
@@ -225,12 +276,12 @@ function PlayerSession({
           failStream('Tidak ada sumber siaran/video yang tersedia.');
           return;
         }
-        const ordered = [...data.streams].sort((a, b) => {
-          const rank = { file: 0, hls: 1, dash: 2, iframe: 3 };
-          return rank[streamKind(a)] - rank[streamKind(b)];
-        });
+        const ordered = data.streams;
         setStreams(ordered);
-        setSelectedStream(ordered[0]);
+        setSelectedStream(playbackSource(ordered[0], browserSupportsHevc(videoRef.current)));
+        if (data.duration && data.duration > 0) {
+          setKnownDuration(data.duration);
+        }
         setSubtitles(data.subtitles);
         setSelectedSubtitle(data.subtitles.find((sub) => /indonesia|\b(id|ina)\b/i.test(sub.name)) || data.subtitles[0] || null);
       } catch (error) {
@@ -269,6 +320,8 @@ function PlayerSession({
     return () => clearTimeout(timer);
   }, [selectedStream, isIframe]);
 
+  const retryAfterRestore = useEffectEvent(() => onRetry());
+
   useEffect(() => {
     if (!selectedStream || isIframe || !videoRef.current) return;
     const videoEl = videoRef.current;
@@ -282,10 +335,14 @@ function PlayerSession({
     let lastTime = -1;
     let lastProgress = Date.now();
     let mediaRecoveries = 0;
+    let closeHlsSession = () => {};
+    const isTranscodedMedia = selectedStream?.headers?.['x-transcode'] === 'h264';
+    const isTranscodedHls = selectedStream?.headers?.['x-transcode-format'] === 'hls';
     const startedAt = Date.now();
-    const startupLimit = isLive ? LIVE_START_TIMEOUT : 22000;
-    const stallLimit = isLive ? LIVE_STALL_TIMEOUT : 18000;
-    const savedPos = isLive ? 0 : getProgress(video.id, episode?.id);
+    const startupLimit = isLive ? LIVE_START_TIMEOUT : (isTranscodedHls ? 70000 : 22000);
+    const stallLimit = isLive ? LIVE_STALL_TIMEOUT : (isTranscodedHls ? 55000 : 18000);
+    const savedPos = isLive ? 0 : (resumePositionRef.current ?? getProgress(video.id, episode?.id));
+    resumePositionRef.current = null;
     const listeners = [];
     const listen = (target, event, handler, options) => {
       target?.addEventListener(event, handler, options);
@@ -295,6 +352,7 @@ function PlayerSession({
       if (disposed || failed) return;
       failed = true;
       hls?.stopLoad();
+      closeHlsSession();
       videoEl.pause();
       audioEl?.pause();
       failStream(message, reason);
@@ -318,7 +376,7 @@ function PlayerSession({
           setLoading(false);
           setBuffering(false);
           setNotice('Tekan Play untuk mulai menonton.');
-        } else fail('Video tidak dapat diputar. Sumber atau format bermasalah.');
+        } else if (!fallbackHevc()) fail('Video tidak dapat diputar. Sumber atau format bermasalah.');
       });
     };
 
@@ -333,7 +391,7 @@ function PlayerSession({
       ready = true;
       setLoading(false);
       setBuffering(false);
-      if (savedPos > 5 && Number.isFinite(videoEl.duration) && savedPos < videoEl.duration - 5) {
+      if (!isTranscodedMedia && savedPos > 0 && Number.isFinite(videoEl.duration) && savedPos < videoEl.duration - 5) {
         videoEl.currentTime = savedPos;
         if (selectedStream.audioUrl && audioEl) audioEl.currentTime = savedPos;
       }
@@ -355,8 +413,18 @@ function PlayerSession({
     });
     listen(videoEl, 'play', () => { autoplayBlocked = false; lastProgress = Date.now(); });
     listen(videoEl, 'pause', () => { setBuffering(false); });
+    const fallbackHevc = () => {
+      if (disposed || failed || isTranscodedMedia || !isHevcSource(selectedStream) || selectedStream.transcodeAllowed === false) return false;
+      resumePositionRef.current = videoEl.currentTime > 0 ? videoEl.currentTime : savedPos;
+      seekOffsetRef.current = 0;
+      setLoading(true);
+      setSelectedStream(playbackSource(selectedStream.originalSource || selectedStream, false, true));
+      return true;
+    };
     listen(videoEl, 'error', () => {
-      if (!hls && !shakaPlayer && videoEl.currentSrc) fail('Sumber video tidak dapat diakses atau format tidak didukung.');
+      if (!hls && !shakaPlayer && videoEl.currentSrc && !fallbackHevc()) {
+        fail('Sumber video tidak dapat diakses atau format tidak didukung.');
+      }
     });
     listen(videoEl, 'ended', () => {
       if (isLive) fail('Siaran telah berhenti. Mencari saluran lain.');
@@ -368,19 +436,52 @@ function PlayerSession({
       if (disposed || failed || autoplayBlocked) return;
       const now = Date.now();
       if (!ready && now - startedAt >= startupLimit) {
-        fail('Sumber tidak merespons dalam batas waktu.');
+        if (!fallbackHevc()) fail('Sumber tidak merespons dalam batas waktu.');
       } else if (ready && !videoEl.paused && !videoEl.ended) {
         if (Math.abs(videoEl.currentTime - lastTime) > 0.05) {
           lastTime = videoEl.currentTime;
           lastProgress = now;
+          if (!isLive && videoEl.currentTime > 4 && videoEl.videoWidth === 0 && fallbackHevc()) return;
         } else if (now - lastProgress >= stallLimit) {
           fail('Siaran terhenti atau terlalu lama melakukan buffering.');
         }
       }
     }, 500);
 
+    let streamHeaders = { ...(selectedStream.headers || {}) };
+    if (isTranscodedMedia && !isTranscodedHls && savedPos > 5 && !seekOffsetRef.current) {
+      seekOffsetRef.current = savedPos;
+      streamHeaders.ss = String(Math.floor(savedPos));
+    }
+
     const kind = streamKind(selectedStream);
-    const playUrl = proxyUrl(selectedStream.url, selectedStream.headers);
+    const sessionId = isTranscodedHls ? createHlsSessionId() : undefined;
+    const playUrl = proxyUrl(selectedStream.url, streamHeaders, sessionId);
+    let heartbeat;
+    if (isTranscodedHls) {
+      seekOffsetRef.current = 0;
+      let released = false;
+      const sessionUrl = `/api/transcode/session?${new URLSearchParams({ sid: sessionId })}`;
+      closeHlsSession = () => {
+        if (released) return;
+        released = true;
+        clearInterval(heartbeat);
+        const closeUrl = `${sessionUrl}&close=1`;
+        if (!navigator.sendBeacon?.(closeUrl)) {
+          fetch(closeUrl, { method: 'POST', keepalive: true }).catch(() => {});
+        }
+      };
+      heartbeat = setInterval(() => {
+        fetch(sessionUrl, { method: 'POST' }).catch(() => {});
+      }, 30000);
+      // A bfcache restoration must recreate a session that pagehide released.
+      listen(window, 'pagehide', closeHlsSession);
+      listen(window, 'pageshow', (event) => { if (event.persisted) retryAfterRestore(); });
+      listen(videoEl, 'loadedmetadata', () => {
+        if (Number.isFinite(videoEl.duration)) setKnownDuration(videoEl.duration);
+        if (!hls && savedPos > 0 && savedPos < videoEl.duration - 5) videoEl.currentTime = savedPos;
+      }, { once: true });
+    }
     if (kind === 'dash') {
       (async () => {
         try {
@@ -444,15 +545,24 @@ function PlayerSession({
       })();
     } else if (kind === 'hls') {
       if (Hls.isSupported()) {
-        const policy = { default: { maxTimeToFirstByteMs: 6000, maxLoadTimeMs: 8000,
+        const policy = { default: { maxTimeToFirstByteMs: isTranscodedHls ? 50000 : 6000,
+          maxLoadTimeMs: isTranscodedHls ? 55000 : 8000,
           timeoutRetry: { maxNumRetry: 1, retryDelayMs: 300, maxRetryDelayMs: 600 },
           errorRetry: { maxNumRetry: 1, retryDelayMs: 300, maxRetryDelayMs: 600 },
         } };
-        hls = new Hls({ enableWorker: true, lowLatencyMode: true, maxBufferLength: 30,
+        hls = new Hls({ enableWorker: true, lowLatencyMode: !isTranscodedHls,
+          startPosition: isTranscodedHls ? Math.max(0, savedPos) : -1,
+          maxBufferLength: isTranscodedHls ? 60 : 30,
+          maxMaxBufferLength: isTranscodedHls ? 60 : 600,
+          backBufferLength: isTranscodedHls ? 120 : Infinity,
           manifestLoadPolicy: policy, playlistLoadPolicy: policy, fragLoadPolicy: policy });
         hlsRef.current = hls;
+        if (isTranscodedHls) hls.on(Hls.Events.LEVEL_LOADED, (_, data) => {
+          if (!disposed) setKnownDuration(data.details.totalduration);
+        });
         hls.on(Hls.Events.ERROR, (_, data) => {
           if (disposed || failed || !data.fatal) return;
+          if (data.type === Hls.ErrorTypes.MEDIA_ERROR && fallbackHevc()) return;
           if (data.type === Hls.ErrorTypes.MEDIA_ERROR && mediaRecoveries++ < 1) {
             hls.recoverMediaError();
           } else fail('Sumber HLS tidak dapat diputar atau sedang offline.');
@@ -473,6 +583,7 @@ function PlayerSession({
     return () => {
       disposed = true;
       clearInterval(watchdog);
+      closeHlsSession();
       listeners.forEach((remove) => remove());
       hls?.destroy();
       if (hlsRef.current === hls) hlsRef.current = null;
@@ -485,7 +596,7 @@ function PlayerSession({
         media.load();
       }
     };
-  }, [selectedStream, isIframe, isLive, video.id, episode?.id]);
+  }, [selectedStream, streams, isIframe, isLive, video.id, episode?.id]);
 
   useEffect(() => {
     for (const media of [videoRef.current, audioRef.current]) {
@@ -503,7 +614,7 @@ function PlayerSession({
   const handleTimeUpdate = () => {
     if (!videoRef.current) return;
     const time = videoRef.current.currentTime;
-    setCurrentTime(time);
+    setCurrentTime(time + (seekOffsetRef.current || 0));
 
     // Sync separate audio track
     if (audioRef.current && selectedStream?.audioUrl) {
@@ -516,14 +627,18 @@ function PlayerSession({
       }
     }
 
+    const totalTime = time + (seekOffsetRef.current || 0);
+
     // Save progress periodically (every 5s)
-    if (!isLive && Math.floor(time) % 5 === 0 && Number.isFinite(duration) && duration > 0) {
-      saveProgress(video.id, episode?.id, time, duration);
+    if (!isLive && Math.floor(totalTime) % 5 === 0 && effectiveDuration > 0) {
+      saveProgress(video.id, episode?.id, totalTime, effectiveDuration);
     }
 
     // Subtitle matching
     if (selectedSubtitle && subtitleCues.length > 0) {
-      const match = subtitleCues.find(c => time >= c.start && time <= c.end);
+      const isTranscoded = selectedStream?.headers?.['x-transcode'] === 'h264';
+      const subTime = isTranscoded ? totalTime : time;
+      const match = subtitleCues.find((c) => subTime >= c.start && subTime <= c.end);
       setCurrentSubtitleText(match ? match.text : '');
     } else {
       setCurrentSubtitleText('');
@@ -564,9 +679,67 @@ function PlayerSession({
     };
   }, []);
 
+  const isTranscodedStream = selectedStream?.headers?.['x-transcode'] === 'h264';
+  const isTranscodedHlsStream = selectedStream?.headers?.['x-transcode-format'] === 'hls';
+  const effectiveDuration = isTranscodedHlsStream && duration > 0
+    ? duration
+    : isTranscodedStream && knownDuration > 0
+    ? knownDuration
+    : ((knownDuration > 0 && (duration <= 30 || !Number.isFinite(duration)))
+      ? knownDuration
+      : (Number.isFinite(duration) && duration > 30 ? duration : (knownDuration || duration || 0)));
+
+  const displayedTime = Math.max(0, currentTime);
+  const progressPercent = effectiveDuration > 0 ? Math.min(100, (displayedTime / effectiveDuration) * 100) : 0;
+
+  const handleSeek = (val) => {
+    if (!videoRef.current || isLive) return;
+    val = Math.max(0, Math.min(effectiveDuration || val, val));
+    const isTranscoded = selectedStream?.headers?.['x-transcode'] === 'h264';
+    const isTranscodedHls = isTranscoded && selectedStream?.headers?.['x-transcode-format'] === 'hls';
+    if (isTranscoded && !isTranscodedHls) {
+      const offset = seekOffsetRef.current || 0;
+      const relativeTarget = val - offset;
+      const media = videoRef.current;
+      const coversTarget = (ranges) => {
+        if (relativeTarget < 0) return false;
+        for (let i = 0; i < ranges.length; i++) {
+          if (relativeTarget >= ranges.start(i) && relativeTarget <= ranges.end(i) - 0.5) return true;
+        }
+        return false;
+      };
+      const canSeekInPlace = coversTarget(media.seekable) && coversTarget(media.buffered);
+      if (canSeekInPlace) {
+        media.currentTime = relativeTarget;
+        setCurrentTime(val);
+        setLoading(false);
+        setBuffering(false);
+        return;
+      }
+      seekOffsetRef.current = val;
+      setCurrentTime(val);
+      setLoading(true);
+      const targetUrl = proxyUrl(selectedStream.url, {
+        ...selectedStream.headers,
+        ss: String(Math.floor(val)),
+      });
+      videoRef.current.src = targetUrl;
+      videoRef.current.load();
+      videoRef.current.play().catch(() => {});
+    } else {
+      seekOffsetRef.current = 0;
+      setCurrentTime(val);
+      videoRef.current.currentTime = val;
+      if (audioRef.current && selectedStream?.audioUrl) {
+        audioRef.current.currentTime = val;
+      }
+    }
+  };
+
   const togglePlay = () => {
     if (!videoRef.current) return;
-    if (videoRef.current.ended || (duration > 0 && Math.abs(videoRef.current.currentTime - duration) < 0.5)) {
+    if (videoRef.current.ended || (effectiveDuration > 0 && Math.abs(displayedTime - effectiveDuration) < 0.5)) {
+      seekOffsetRef.current = 0;
       videoRef.current.currentTime = 0;
       if (audioRef.current && selectedStream?.audioUrl) {
         audioRef.current.currentTime = 0;
@@ -591,12 +764,10 @@ function PlayerSession({
   };
 
   const seekDelta = (seconds) => {
-    if (!videoRef.current || isLive || !Number.isFinite(duration) || duration <= 0) return;
-    const target = Math.max(0, Math.min(duration, videoRef.current.currentTime + seconds));
-    videoRef.current.currentTime = target;
-    if (audioRef.current && selectedStream?.audioUrl) {
-      audioRef.current.currentTime = target;
-    }
+    if (!videoRef.current || isLive) return;
+    const maxDur = effectiveDuration > 0 ? effectiveDuration : (duration > 0 ? duration : 100);
+    const target = Math.max(0, Math.min(maxDur, displayedTime + seconds));
+    handleSeek(target);
   };
 
   const setVolumeLevel = (newVol) => {
@@ -745,8 +916,6 @@ function PlayerSession({
     window.addEventListener('keydown', listener);
     return () => window.removeEventListener('keydown', listener);
   }, []);
-
-  const progressPercent = Number.isFinite(duration) && duration > 0 ? Math.min(100, (currentTime / duration) * 100) : 0;
 
   return (
     <div
@@ -905,6 +1074,36 @@ function PlayerSession({
                 >
                   Kembali
                 </button>
+              </div>
+              {/* Rekomendasi Film Populer Gratis / Langsung Putar */}
+              <div className="mt-5 pt-4 border-t border-white/10 w-full max-w-md text-left">
+                <p className="text-xs font-semibold text-gray-300 mb-2 flex items-center gap-1.5">
+                  <Film className="w-3.5 h-3.5 text-[#e50914]" />
+                  <span>Rekomendasi Film yang Tersedia Langsung:</span>
+                </p>
+                <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+                  {RECOMMENDED_MOVIES.map((mov) => (
+                    <a
+                      key={mov.id}
+                      href={`/watch?model_id=Moviebox&id=${mov.id}&title=${encodeURIComponent(mov.title)}&type=movie`}
+                      className="flex items-center gap-2 p-1.5 rounded-lg bg-white/5 hover:bg-white/10 border border-white/5 hover:border-white/20 transition-all group"
+                    >
+                      <div className="w-6 h-8 rounded bg-[#1c2132] overflow-hidden shrink-0">
+                        <img
+                          src={mov.poster}
+                          alt={mov.title}
+                          className="w-full h-full object-cover group-hover:scale-105 transition-transform"
+                        />
+                      </div>
+                      <div className="min-w-0">
+                        <p className="text-[11px] font-semibold text-white/90 group-hover:text-white truncate">
+                          {mov.title}
+                        </p>
+                        <span className="text-[9px] text-green-400 font-medium">Bisa Diputar</span>
+                      </div>
+                    </a>
+                  ))}
+                </div>
               </div>
             </>
           )}
@@ -1140,16 +1339,17 @@ function PlayerSession({
                     </button>
                     <div className="max-h-56 overflow-y-auto py-1 space-y-0.5">
                       {streams.map((st, idx) => {
-                        const isSelected = selectedStream === st;
+                        const isSelected = (selectedStream?.originalSource || selectedStream) === st;
                         return (
                           <button
                             key={idx}
                             onClick={() => {
-                              if (selectedStream === st) return;
+                              if ((selectedStream?.originalSource || selectedStream) === st) return;
                               failedStreams.current.clear();
                               setError(null);
                               setLoading(true);
-                              setSelectedStream(st);
+                              resumePositionRef.current = videoRef.current?.currentTime || 0;
+                              setSelectedStream(playbackSource(st, browserSupportsHevc(videoRef.current)));
                               setShowSettingsMenu(false);
                               setSettingsTab('main');
                             }}
@@ -1239,16 +1439,12 @@ function PlayerSession({
                 <input
                   type="range"
                   min={0}
-                  max={duration || 100}
+                  max={effectiveDuration || 100}
                   step={0.1}
-                  value={currentTime}
+                  value={displayedTime}
                   onChange={(e) => {
                     const val = parseFloat(e.target.value);
-                    setCurrentTime(val);
-                    if (videoRef.current) videoRef.current.currentTime = val;
-                    if (audioRef.current && selectedStream?.audioUrl) {
-                      audioRef.current.currentTime = val;
-                    }
+                    handleSeek(val);
                   }}
                   className="absolute inset-0 w-full h-full opacity-0 cursor-pointer z-10"
                 />
@@ -1334,9 +1530,9 @@ function PlayerSession({
                   </div>
                 ) : (
                   <div className="text-xs sm:text-sm font-medium text-white/90 pl-1 select-none flex items-center gap-1">
-                    <span>{formatTime(currentTime)}</span>
+                    <span>{formatTime(displayedTime)}</span>
                     <span className="text-white/40">/</span>
-                    <span className="text-white/60">{formatTime(duration)}</span>
+                    <span className="text-white/60">{formatTime(effectiveDuration)}</span>
                   </div>
                 )}
               </div>

@@ -1,3 +1,19 @@
+import path from 'path';
+import fs from 'fs';
+import { spawn } from 'child_process';
+
+// Resolve real filesystem path for ffmpeg binary (prevent Turbopack \\ROOT\\ virtualization)
+function getFfmpegPath() {
+  const binaryName = process.platform === 'win32' ? 'ffmpeg.exe' : 'ffmpeg';
+  const directPath = path.join(process.cwd(), 'node_modules', 'ffmpeg-static', binaryName);
+  if (fs.existsSync(directPath)) return directPath;
+  try {
+    const pkg = require('ffmpeg-static');
+    if (typeof pkg === 'string' && fs.existsSync(pkg)) return pkg;
+  } catch {}
+  return null;
+}
+
 // Disable TLS unauthorized rejection so proxy can connect to IPTV CDNs with untrusted or self-signed certs
 process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
 
@@ -10,6 +26,8 @@ export async function GET(request) {
     const cookie = searchParams.get('cookie') || '';
     const origin = searchParams.get('origin') || '';
     const authorization = searchParams.get('authorization') || '';
+    const transcode = searchParams.get('transcode') || '';
+    const seekSeconds = parseFloat(searchParams.get('ss') || '0') || 0;
 
     if (!targetUrl) {
       return new Response('Missing url query parameter', { status: 400 });
@@ -31,12 +49,25 @@ export async function GET(request) {
       targetUrl.includes('bstarstatic.com') ||
       targetUrl.includes('bilibili.');
 
+    const isMovieBox =
+      targetUrl.includes('hakunaymatata.com') ||
+      targetUrl.includes('aoneroom.com') ||
+      targetUrl.includes('inmoviebox.com') ||
+      targetUrl.includes('sportslive.wine') ||
+      targetUrl.includes('vidio-ugc.com') ||
+      targetUrl.includes('fzmovies.cms') ||
+      targetUrl.includes('m-stream.') ||
+      targetUrl.includes('wefeed-');
+
     let effectiveUserAgent = userAgent;
     let effectiveReferer = referer;
 
     if (isBili) {
       effectiveUserAgent = 'Bilibili Freedome/1.0.0 (Android; 13)';
       effectiveReferer = ''; // Do not send desktop referer to avoid 403 on Bilibili CDNs
+    } else if (isMovieBox) {
+      effectiveUserAgent = 'MovieBox/4.0.02 (Android 14; Pixel 6)';
+      effectiveReferer = ''; // Do not send desktop or local referer to avoid 428/403 on MovieBox CDNs
     }
 
     const headers = {
@@ -57,6 +88,75 @@ export async function GET(request) {
       headers['Authorization'] = authorization;
     }
 
+    // On-the-fly H.264 real-time transcode for HEVC / unsupported codecs across all browsers & devices
+    const ffmpegBin = getFfmpegPath();
+    if (transcode === 'h264' && ffmpegBin) {
+      const ffmpegArgs = [
+        '-headers', `User-Agent: ${effectiveUserAgent}\r\n`,
+      ];
+      if (seekSeconds > 0) {
+        ffmpegArgs.push('-ss', String(seekSeconds));
+      }
+      ffmpegArgs.push(
+        '-i', targetUrl,
+        '-c:v', 'libx264',
+        '-preset', 'ultrafast',
+        '-tune', 'zerolatency',
+        '-crf', '26',
+        '-c:a', 'copy',
+        '-f', 'mp4',
+        '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
+        'pipe:1'
+      );
+
+      const ff = spawn(/*turbopackIgnore: true*/ ffmpegBin, ffmpegArgs, { stdio: ['ignore', 'pipe', 'pipe'] });
+      let streamClosed = false;
+
+      const transcodeStream = new ReadableStream({
+        start(controller) {
+          ff.stdout.on('data', (chunk) => {
+            if (!streamClosed) {
+              try { controller.enqueue(chunk); } catch { streamClosed = true; }
+            }
+          });
+          ff.stdout.on('end', () => {
+            if (!streamClosed) {
+              streamClosed = true;
+              try { controller.close(); } catch {}
+            }
+          });
+          ff.on('error', (err) => {
+            if (!streamClosed) {
+              streamClosed = true;
+              try { controller.error(err); } catch {}
+            }
+          });
+          ff.stderr.on('data', () => {});
+        },
+        cancel() {
+          streamClosed = true;
+          try { ff.kill('SIGKILL'); } catch {}
+        },
+      });
+
+      request.signal?.addEventListener('abort', () => {
+        streamClosed = true;
+        try { ff.kill('SIGKILL'); } catch {}
+      });
+
+      return new Response(transcodeStream, {
+        status: 200,
+        headers: {
+          'Content-Type': 'video/mp4',
+          'Access-Control-Allow-Origin': '*',
+          'Access-Control-Allow-Methods': 'GET, HEAD, OPTIONS',
+          'Access-Control-Allow-Headers': '*',
+          'Cache-Control': 'no-cache, no-store, must-revalidate',
+          'X-Transcode': 'h264',
+        },
+      });
+    }
+
     // Forward range header for video seeking support
     const range = request.headers.get('range');
     if (range) {
@@ -70,6 +170,28 @@ export async function GET(request) {
         redirect: 'follow',
         cache: 'no-store',
       });
+
+      // If upstream rejects with 428 or 403, retry with mobile ExoPlayer UA and stripped referer
+      if (!upstreamResponse.ok && (upstreamResponse.status === 428 || upstreamResponse.status === 403)) {
+        try {
+          const retryHeaders = {
+            ...headers,
+            'User-Agent': 'ExoPlayerLib/2.18.1',
+          };
+          delete retryHeaders['Referer'];
+          delete retryHeaders['Origin'];
+          const retryRes = await fetch(targetUrl, {
+            headers: retryHeaders,
+            redirect: 'follow',
+            cache: 'no-store',
+          });
+          if (retryRes.ok) {
+            upstreamResponse = retryRes;
+          }
+        } catch (retryErr) {
+          console.warn('Stream proxy retry error:', retryErr.message);
+        }
+      }
     } catch (fetchErr) {
       console.warn('Stream proxy upstream connection error:', fetchErr.message);
       return new Response(JSON.stringify({ error: 'channel_offline', message: 'Saluran saat ini sedang offline' }), {
@@ -170,8 +292,7 @@ export async function GET(request) {
       responseHeaders.set('Content-Type', contentType);
     }
 
-    const acceptRanges = upstreamResponse.headers.get('accept-ranges');
-    if (acceptRanges) responseHeaders.set('Accept-Ranges', acceptRanges);
+    responseHeaders.set('Accept-Ranges', 'bytes');
 
     const contentRange = upstreamResponse.headers.get('content-range');
     if (contentRange) responseHeaders.set('Content-Range', contentRange);

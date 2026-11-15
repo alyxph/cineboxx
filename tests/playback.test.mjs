@@ -33,6 +33,19 @@ test('normalization retains inherited headers and DRM and deduplicates identical
   assert.equal(proxied.searchParams.get('authorization'), 'test');
 });
 
+test('HLS transcode uses one explicit session and ignores the upstream MP4 extension', () => {
+  const stream = { url: 'https://cdn.example/hevc.mp4', format: 'hls', headers: {
+    'x-transcode': 'h264', 'x-transcode-format': 'hls', 'x-transcode-height': '720', Origin: 'https://example.com',
+  } };
+  assert.equal(streamKind(stream), 'hls');
+  const url = proxyUrl(stream.url, stream.headers, 'player-session-12345678');
+  assert.equal(proxyUrl(stream.url, { ...stream.headers, ss: '100' }, 'player-session-12345678'), url);
+  const parsed = new URL(url, 'https://local.example');
+  assert.equal(parsed.pathname, '/api/transcode/hls');
+  assert.equal(parsed.searchParams.get('session'), 'player-session-12345678');
+  assert.equal(parsed.searchParams.get('origin'), 'https://example.com');
+});
+
 test('TV selection wraps, skips failed channels and stops after every candidate failed', () => {
   const channels = [{ id: 'a' }, { id: 'b' }, { id: 'c' }];
   assert.equal(nextAvailableChannel(channels, 'c', new Set(['a', 'c'])).id, 'b');

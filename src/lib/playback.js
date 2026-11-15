@@ -15,6 +15,7 @@ export function validMediaUrl(value) {
 }
 
 export function streamKind(stream) {
+  if (stream?.headers?.['x-transcode-format'] === 'hls') return 'hls';
   const format = String(stream?.format || '').toLowerCase();
   const url = String(stream?.url || '');
   const path = url.split(/[?#]/)[0].toLowerCase();
@@ -29,11 +30,45 @@ export function streamKind(stream) {
   return 'file';
 }
 
-export function proxyUrl(url, headers = {}) {
+export function createHlsSessionId() {
+  try {
+    if (globalThis.crypto?.randomUUID) return globalThis.crypto.randomUUID();
+  } catch {}
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+}
+
+export function proxyUrl(url, headers = {}, sessionId) {
   if (!validMediaUrl(url)) return url || '';
   const values = Object.fromEntries(Object.entries(headers || {}).map(([key, value]) => [key.toLowerCase(), value]));
+
+  if (values['x-transcode-format'] === 'hls') {
+    const params = new URLSearchParams({ url: validMediaUrl(url) });
+    for (const [header, param] of [
+      ['referer', 'referer'],
+      ['user-agent', 'ua'],
+      ['cookie', 'cookie'],
+      ['origin', 'origin'],
+      ['authorization', 'authorization'],
+    ]) {
+      if (typeof values[header] === 'string' && values[header]) params.set(param, values[header]);
+    }
+    params.set('height', values['x-transcode-height'] || '720');
+    params.set('session', sessionId || createHlsSessionId());
+    return `/api/transcode/hls?${params}`;
+  }
+
   const params = new URLSearchParams({ url: validMediaUrl(url) });
-  for (const [header, param] of [['referer', 'referer'], ['user-agent', 'ua'], ['cookie', 'cookie'], ['origin', 'origin'], ['authorization', 'authorization']]) {
+  for (const [header, param] of [
+    ['referer', 'referer'],
+    ['user-agent', 'ua'],
+    ['cookie', 'cookie'],
+    ['origin', 'origin'],
+    ['authorization', 'authorization'],
+    ['x-transcode', 'transcode'],
+    ['transcode', 'transcode'],
+    ['ss', 'ss'],
+    ['x-ss', 'ss'],
+  ]) {
     if (typeof values[header] === 'string' && values[header]) params.set(param, values[header]);
   }
   return `/api/stream?${params}`;
@@ -72,7 +107,12 @@ export function normalizeSources(data = {}) {
     const url = pickUrl(track.url || track.file);
     return url ? [{ url, name: String(track.name || track.lang || track.language || track.label || 'Bahasa'), headers: { ...(root.headers || {}), ...(track.headers || {}) } }] : [];
   });
-  return { streams, subtitles, headers: root.headers || {} };
+  return {
+    streams,
+    subtitles,
+    headers: root.headers || {},
+    duration: Number(root.duration) || 0,
+  };
 }
 
 export function nextAvailableChannel(channels, currentId, failedIds) {

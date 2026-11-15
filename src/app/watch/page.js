@@ -17,6 +17,7 @@ import {
   Play,
   Star,
   Tv,
+  Volume2,
 } from 'lucide-react';
 
 function getTvCountryCode(channelId) {
@@ -33,6 +34,15 @@ function getTvCountryCode(channelId) {
     if (parts[1]) return parts[1];
   }
   return 'ID';
+}
+
+function formatVersionLabel(version) {
+  if (version?.original) return 'Original';
+  const name = String(version?.name || '')
+    .replace(/\s*dub$/i, '')
+    .replace(/\s*audio$/i, '')
+    .trim();
+  return name || 'Versi';
 }
 
 function WatchContent() {
@@ -182,6 +192,7 @@ function WatchContent() {
   }, [modelId, id, detailKey, isLive, isBlockedContent]);
 
   const seasons = useMemo(() => (Array.isArray(detail?.seasons) ? detail.seasons : []), [detail]);
+  const versions = useMemo(() => (Array.isArray(detail?.versions) ? detail.versions : []), [detail]);
 
   const allEpisodes = useMemo(
     () =>
@@ -232,6 +243,30 @@ function WatchContent() {
     setTimeout(() => {
       isNavigatingEpisodeRef.current = false;
     }, 800);
+  };
+
+  const navigateToVersion = (version) => {
+    if (!version || String(version.id) === String(id)) return;
+    const params = new URLSearchParams(searchParams.toString());
+    params.set('id', String(version.id));
+
+    if (isSeries && displayEpisode?.num) {
+      const activeSeason = seasons.find(
+        (season) => Array.isArray(season.episodes) && season.episodes.some(
+          (ep) => String(ep.id) === String(displayEpisode.id)
+        )
+      );
+      const seasonNumber = activeSeason?.season || 1;
+      params.set('episode_id', `${version.id}_${seasonNumber}_${displayEpisode.num}`);
+      params.set('ep', String(displayEpisode.num));
+      params.set('season', activeSeason?.name || `Season ${seasonNumber}`);
+    } else {
+      params.delete('episode_id');
+      params.delete('ep');
+      params.delete('season');
+    }
+
+    router.replace(`/watch?${params.toString()}`, { scroll: false });
   };
 
   const handleBack = () => {
@@ -650,6 +685,35 @@ function WatchContent() {
               ) : (
                 /* SERIES EPISODES SIDEBAR */
                 <>
+                  {versions.length > 1 && (
+                    <div className="rounded-xl border border-white/5 bg-[#131622] p-3 space-y-2">
+                      <div className="flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wide text-gray-400">
+                        <Volume2 className="w-3.5 h-3.5 text-[#e50914]" />
+                        <span>Audio</span>
+                      </div>
+                      <div className="flex flex-wrap gap-1.5">
+                        {versions.map((version) => {
+                          const isActiveVersion = String(version.id) === String(id);
+                          return (
+                            <button
+                              key={version.id}
+                              type="button"
+                              onClick={() => navigateToVersion(version)}
+                              disabled={isActiveVersion}
+                              className={`px-2.5 py-1 rounded-md text-[11px] font-medium border transition-colors ${
+                                isActiveVersion
+                                  ? 'bg-white text-[#090a0f] border-white cursor-default'
+                                  : 'bg-[#090a0f] text-gray-300 border-white/10 hover:border-white/25 hover:text-white'
+                              }`}
+                            >
+                              {formatVersionLabel(version)}
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  )}
+
                   <div className="space-y-2.5">
                     <div className="flex items-center justify-between px-1">
                       <h2 className="text-sm font-bold text-white flex items-center gap-2">

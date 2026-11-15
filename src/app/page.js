@@ -6,6 +6,11 @@ import Navbar from '@/components/Navbar';
 import MovieCard from '@/components/MovieCard';
 import { Film, ChevronDown, ChevronLeft, ChevronRight, RefreshCw, AlertCircle, Loader2 } from 'lucide-react';
 
+function getVideoGroupKey(video) {
+  const title = String(video?.canonicalTitle || video?.title || '').trim().toLowerCase();
+  return `${title}|${video?.type || ''}`;
+}
+
 function HorizontalScrollBar({ children, className = '' }) {
   const scrollRef = useRef(null);
   const [canScrollLeft, setCanScrollLeft] = useState(false);
@@ -155,8 +160,13 @@ function HomeContent() {
 
         setVideos((prev) => {
           if (!append) return newVids;
-          const existingIds = new Set(prev.map((v) => v.id));
-          const uniqueNew = newVids.filter((v) => !existingIds.has(v.id));
+          const seen = new Set(prev.map(getVideoGroupKey));
+          const uniqueNew = newVids.filter((v) => {
+            const key = getVideoGroupKey(v);
+            if (seen.has(key)) return false;
+            seen.add(key);
+            return true;
+          });
           return [...prev, ...uniqueNew];
         });
       } else {
