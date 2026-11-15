@@ -169,3 +169,50 @@ test('HEVC capability false positives fall back silently at the same resolution'
   await expect(page.getByText('Ganti ke H.264', { exact: true })).toHaveCount(0);
   await page.goto('/search');
 });
+
+test('audio-only HEVC playback recovers automatically through HLS and retains position', async ({ page }) => {
+  test.setTimeout(90000);
+  await mockMovie(page);
+  await page.addInitScript(() => {
+    const original = HTMLMediaElement.prototype.canPlayType;
+    HTMLMediaElement.prototype.canPlayType = function(type) { return /hvc1|hev1/.test(type) ? 'probably' : original.call(this, type); };
+    localStorage.setItem('cinebox_playback_progress', JSON.stringify({ 'audio-only': { currentTime: 20, duration: 180 } }));
+  });
+  // A real playable audio-only response reproduces time advancing with videoWidth=0.
+  const wav = Buffer.alloc(44 + 8000 * 2 * 90);
+  wav.write('RIFF', 0); wav.writeUInt32LE(wav.length - 8, 4); wav.write('WAVEfmt ', 8);
+  wav.writeUInt32LE(16, 16); wav.writeUInt16LE(1, 20); wav.writeUInt16LE(1, 22);
+  wav.writeUInt32LE(8000, 24); wav.writeUInt32LE(16000, 28); wav.writeUInt16LE(2, 32);
+  wav.writeUInt16LE(16, 34); wav.write('data', 36); wav.writeUInt32LE(wav.length - 44, 40);
+  await page.route('**/api/stream?**', (route) => {
+    const range = route.request().headers().range?.match(/^bytes=(\d+)-(\d*)$/);
+    const start = range ? Number(range[1]) : 0;
+    const end = range?.[2] ? Math.min(Number(range[2]), wav.length - 1) : wav.length - 1;
+    return route.fulfill({ status: range ? 206 : 200, contentType: 'audio/wav', body: wav.subarray(start, end + 1),
+      headers: { 'Accept-Ranges': 'bytes', ...(range ? { 'Content-Range': `bytes ${start}-${end}/${wav.length}` } : {}) } });
+  });
+  const playlists = [];
+  page.on('request', (req) => { if (req.url().includes('/api/transcode/hls?')) playlists.push(req.url()); });
+  await page.goto('/watch?id=audio-only&model_id=Test&type=movie&title=HEVC');
+  const video = page.locator('video');
+  await expect.poll(() => video.evaluate((v) => v.videoHeight), { timeout: 60000 }).toBe(144);
+  await expect.poll(() => video.evaluate((v) => v.currentTime)).toBeGreaterThan(20);
+  expect(playlists).toHaveLength(1);
+  await expect(page.getByText('Ganti ke H.264', { exact: true })).toHaveCount(0);
+  await page.goto('/search');
+});
+
+test('HEVC without an available worker stops cleanly instead of launching legacy transcodes', async ({ page }) => {
+  await mockMovie(page);
+  await page.route('**/api/catalog/source?**', (route) => route.fulfill({ json: { success: true, data: {
+    streams: movieboxQualities([{ name: '480p HEVC', url: fixture.url }], false),
+  } } }));
+  await page.route('**/api/stream?**', (route) => route.fulfill({ contentType: 'video/mp4', body: 'unsupported codec' }));
+  const transcodes = [];
+  page.on('request', (req) => { if (/transcode=h264|\/api\/transcode\//.test(req.url())) transcodes.push(req.url()); });
+  await page.goto('/watch?id=no-worker&model_id=Test&type=movie&title=HEVC');
+  await expect(page.locator('main').getByRole('alert')).toContainText('Video ini belum tersedia dalam format yang dapat diputar di perangkat ini.');
+  expect(transcodes).toEqual([]);
+  await expect(page.getByText('Ganti ke H.264', { exact: true })).toHaveCount(0);
+  await page.goto('/search');
+});

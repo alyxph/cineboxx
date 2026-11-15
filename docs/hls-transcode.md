@@ -28,10 +28,50 @@ Untuk beberapa replica, gunakan sticky routing untuk **semua** `/api/transcode/*
 berdasarkan `session`/`sid`, atau pisahkan layanan transcode dengan routing sesi.
 Cache dan proses belum dibagikan antar-instance.
 
-Transcode ini dinonaktifkan pada Vercel (`VERCEL` terisi). Function yang terpisah
+Transcode lokal dinonaktifkan pada Vercel, Netlify, dan AWS Lambda. Function yang terpisah
 tidak berbagi proses ffmpeg dan cache lokal, dan eksekusinya dibatasi durasi.
 Sumber H.264 native dan proxy yang sudah ada masih dapat digunakan di Vercel;
 HEVC-only memerlukan browser yang mendukung HEVC atau deployment Node/Docker.
+Untuk tetap menempatkan web di Netlify, gunakan worker terpisah di bawah.
+
+## Web Netlify dengan worker transcode terpisah
+
+Worker menjalankan image Docker aplikasi yang sama pada **satu instance persisten**
+dengan HTTPS. Jangan memasang `NETLIFY`, `VERCEL`, atau `HLS_WORKER_URL` di worker.
+Set `HLS_WORKER_TOKEN` ke secret acak yang panjang pada worker. Semua endpoint
+playlist, segmen, heartbeat, dan penutupan sesi memeriksa token tersebut.
+
+Di environment server Netlify, pasang:
+
+```env
+HLS_WORKER_URL=https://domain-worker-anda.example
+HLS_WORKER_TOKEN=secret-yang-sama-dengan-worker
+```
+
+URL harus berupa origin HTTPS tanpa path/query. Jangan memakai prefix `NEXT_PUBLIC_`.
+Deploy ulang kedua aplikasi setelah mengubah environment. Worker harus memakai
+kode versi yang sama. Netlify meneruskan seluruh `/api/transcode/*` ke worker dengan
+autentikasi server; browser tetap memakai URL Netlify dan tidak menerima secret.
+Resolusi terpilih, posisi, seek, heartbeat, dan cleanup memakai sesi worker yang sama.
+Jangan mengarahkan worker kembali ke Netlify; gateway menolak loop.
+
+Tanpa worker, H.264 native dan HEVC yang didukung perangkat tetap diputar langsung.
+Jika decoder HEVC gagal, pemutar mencoba H.264 native yang tersedia; jika tidak ada,
+pemutar menampilkan kegagalan yang jelas. Pemutar tidak lagi mencoba ffmpeg lewat
+respons MP4 panjang atau meminta penonton mengganti codec/VLC. Penanganan audio
+tanpa gambar mendeteksi frame yang tidak tampil, lalu beralih otomatis ke HLS pada
+resolusi dan posisi yang sama ketika worker tersedia. Safari memakai HLS native.
+
+Ini menyiapkan integrasi, bukan menyediakan server atau menjamin tanpa buffering.
+CPU worker, jumlah penonton, akses CDN, dan bandwidth tetap menentukan waktu tunggu.
+Netlify tetap meneruskan trafik segmen: perhatikan batas durasi/ukuran respons dan
+biaya bandwidth sebelum menaikkan jumlah penonton. Untuk trafik besar, gunakan
+penyimpanan segmen/CDN bersama dan routing sesi, bukan menambah replica begitu saja.
+
+Verifikasi setelah deployment: API source harus menunjukkan `transcodeAllowed: true`;
+putar HEVC di Chrome, uji iPhone fisik, seek +10 dan jauh, kemudian tutup tab dan
+pastikan sesi tidak lagi dapat di-heartbeat. Uji saat ini memakai fixture browser
+desktop; itu tidak menggantikan pengujian Safari iPhone fisik.
 
 ## Cara kerja
 

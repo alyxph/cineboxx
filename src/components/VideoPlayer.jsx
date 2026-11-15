@@ -3,7 +3,7 @@
 import { useState, useEffect, useRef, useCallback, useEffectEvent } from 'react';
 import Hls from 'hls.js';
 import { initialQuality, adaptiveQuality, qualityLadder } from '@/lib/adaptive-quality';
-import { browserSupportsHevc, isHevcSource, playbackSource, sourceResolution, getStreamCodec } from '@/lib/transcode-sources';
+import { browserSupportsHevc, isHevcSource, playbackSource, sourceResolution } from '@/lib/transcode-sources';
 import {
   Play,
   Pause,
@@ -24,9 +24,6 @@ import {
   RadioOff,
   Tv,
   Film,
-  AlertTriangle,
-  Copy,
-  X,
 } from 'lucide-react';
 import { saveProgress, getProgress } from '@/lib/storage';
 import { fetchJson } from '@/lib/http';
@@ -121,15 +118,13 @@ function PlayerSession({
   const [buffering, setBuffering] = useState(false);
   const [error, setError] = useState(null);
   const [isChannelOffline, setIsChannelOffline] = useState(false);
-  const [hevcIssue, setHevcIssue] = useState(false);
-  const [copySuccess, setCopySuccess] = useState('');
   const resumePositionRef = useRef(null);
 
   const [notice, setNotice] = useState('');
   const [episodeBanner, setEpisodeBanner] = useState(null);
   const [ended, setEnded] = useState(false);
   const failedStreams = useRef(new Set());
-  const autoSwitchedHevc = useRef(false);
+  const hevcDecodeFailed = useRef(false);
 
 
   // Stream data
@@ -179,36 +174,6 @@ function PlayerSession({
   };
 
 
-  const fallbackCopy = (text) => {
-    try {
-      const textarea = document.createElement('textarea');
-      textarea.value = text;
-      textarea.style.position = 'fixed';
-      textarea.style.opacity = '0';
-      document.body.appendChild(textarea);
-      textarea.select();
-      document.execCommand('copy');
-      document.body.removeChild(textarea);
-      setCopySuccess('Link Tersalin!');
-      setTimeout(() => setCopySuccess(''), 3000);
-    } catch {}
-  };
-
-  const handleCopyStreamLink = () => {
-    if (!selectedStream?.url) return;
-    const fullProxyUrl = typeof window !== 'undefined'
-      ? `${window.location.origin}${proxyUrl(selectedStream.url, selectedStream.headers)}`
-      : selectedStream.url;
-    if (navigator.clipboard?.writeText) {
-      navigator.clipboard.writeText(fullProxyUrl).then(() => {
-        setCopySuccess('Link Tersalin!');
-        setTimeout(() => setCopySuccess(''), 3000);
-      }).catch(() => fallbackCopy(fullProxyUrl));
-    } else {
-      fallbackCopy(fullProxyUrl);
-    }
-  };
-
   const failStream = useEffectEvent((message, reason = 'unavailable') => {
     const offline = navigator.onLine === false;
     if (selectedStream) failedStreams.current.add(selectedStream.originalSource || selectedStream);
@@ -235,7 +200,7 @@ function PlayerSession({
       setBuffering(false);
       resumePositionRef.current = videoRef.current?.currentTime || 0;
       qualityHealth.current.changedAt = Date.now();
-      setSelectedStream(playbackSource(next, browserSupportsHevc(videoRef.current)));
+      setSelectedStream(playbackSource(next, (browserSupportsHevc(videoRef.current) && !hevcDecodeFailed.current)));
       return;
     }
     const info = offline ? 'Koneksi internet terputus. Hubungkan kembali lalu tekan Coba Lagi.' : message;
@@ -292,7 +257,7 @@ function PlayerSession({
 
     failedStreams.current.clear();
     loadedIframeUrl.current = '';
-    autoSwitchedHevc.current = false;
+    hevcDecodeFailed.current = false;
     resumePositionRef.current = null;
     resumePausedRef.current = false;
     const qualityKey = `${video.id}:${episode?.id || ''}`;
@@ -305,8 +270,6 @@ function PlayerSession({
     setBuffering(false);
     setError(null);
     setIsChannelOffline(false);
-    setHevcIssue(false);
-    setCopySuccess('');
 
 
     setNotice('');
@@ -349,7 +312,7 @@ function PlayerSession({
         const preference = qualityPreference.current;
         const manual = preference.mode === 'manual' && ordered.find((stream) => preference.height
           ? sourceResolution(stream) === preference.height : stream.url === preference.url);
-        const hevcSupported = browserSupportsHevc(videoRef.current);
+        const hevcSupported = (browserSupportsHevc(videoRef.current) && !hevcDecodeFailed.current);
         const initial = manual || (isLive ? ordered[0] : initialQuality(ordered, navigator.connection, hevcSupported));
         if (preference.mode === 'manual' && !manual) { preference.mode = 'auto'; setAutoQuality(true); }
         qualityHealth.current.changedAt = Date.now();
@@ -408,7 +371,7 @@ function PlayerSession({
     resumePausedRef.current = Boolean(media?.paused && media.readyState > 0);
     qualityHealth.current = { changedAt: Date.now(), stableSince: Date.now(), waitingSince: 0 };
     failedStreams.current.clear(); setError(null); setLoading(true);
-    setSelectedStream(playbackSource(source, browserSupportsHevc(media), Boolean(selectedStream?.originalSource)));
+    setSelectedStream(playbackSource(source, (browserSupportsHevc(media) && !hevcDecodeFailed.current), Boolean(selectedStream?.originalSource)));
   };
 
   const checkAutoQuality = useEffectEvent((startup = false) => {
@@ -426,7 +389,8 @@ function PlayerSession({
     const waiting = starting || (media.readyState < 3 && ahead < 1);
     if (waiting) { health.waitingSince ||= now; health.stableSince = now; }
     else { health.waitingSince = 0; if (ahead < 10) health.stableSince = now; }
-    const next = adaptiveQuality({ streams: streams.filter((stream) => !failedStreams.current.has(stream)),
+    const next = adaptiveQuality({ streams: streams.filter((stream) => !failedStreams.current.has(stream) &&
+        (!hevcDecodeFailed.current || !isHevcSource(stream) || stream.transcodeAllowed !== false)),
       current: selectedStream, connection: navigator.connection, bufferAhead: ahead,
       waitingMs: health.waitingSince ? now - health.waitingSince : 0,
       stableMs: now - health.stableSince, sinceSwitchMs: now - health.changedAt,
@@ -549,41 +513,42 @@ function PlayerSession({
     listen(videoEl, 'play', () => { autoplayBlocked = false; lastProgress = Date.now(); });
     listen(videoEl, 'pause', () => { setBuffering(false); });
     const fallbackHevc = () => {
-      if (disposed || failed || isTranscodedMedia || !isHevcSource(selectedStream) || selectedStream.transcodeAllowed === false) return false;
-      resumePositionRef.current = videoEl.currentTime || savedPos;
+      if (disposed || failed || isTranscodedMedia || !isHevcSource(selectedStream)) return false;
+      hevcDecodeFailed.current = true;
+      const original = selectedStream.originalSource || selectedStream;
+      // Keep the selected resolution whenever a transcode worker is available.
+      let next = playbackSource(original, false, true);
+      if (next === original) {
+        const native = streams.filter((source) => !isHevcSource(source) && !failedStreams.current.has(source));
+        const ladder = qualityLadder(native);
+        next = ladder.filter((source) => sourceResolution(source) <= sourceResolution(original)).at(-1) || ladder[0] || native[0];
+      }
+      if (!next) {
+        fail('Video ini belum tersedia dalam format yang dapat diputar di perangkat ini.', 'unsupported');
+        return true;
+      }
+      resumePositionRef.current = videoEl.readyState > 0 ? videoEl.currentTime + seekOffsetRef.current : savedPos;
+      resumePausedRef.current = videoEl.paused && videoEl.readyState > 0;
+      failed = true; // Ignore late events from the source being replaced.
+      failedStreams.current.add(original);
+      hls?.stopLoad();
+      videoEl.pause();
+      audioEl?.pause();
+      qualityHealth.current = { changedAt: Date.now(), stableSince: Date.now(), waitingSince: 0 };
       setLoading(true);
-      setSelectedStream(playbackSource(selectedStream.originalSource || selectedStream, false, true));
+      setBuffering(false);
+      setNotice('Menyiapkan video untuk perangkat ini...');
+      setSelectedStream(next);
       return true;
     };
     listen(videoEl, 'error', () => {
       if (!hls && !shakaPlayer && videoEl.currentSrc) {
-        if (isHevcSource(selectedStream) && !autoSwitchedHevc.current && !selectedStream?.headers?.['x-transcode']) {
-          autoSwitchedHevc.current = true;
-          const h264Alternative = streams.find(
-            (s) => s.url !== selectedStream?.url && (!isHevcSource(s) || s.headers?.['x-transcode'] === 'h264')
-          );
-          if (h264Alternative) {
-            setNotice('Beralih otomatis ke format H.264...');
-            setSelectedStream(h264Alternative);
-            return;
-          }
-          setNotice('Format HEVC tidak didukung. Mengonversi otomatis ke H.264...');
-          setSelectedStream({
-            ...selectedStream,
-            name: `${selectedStream.name} (H.264)`,
-            headers: {
-              ...selectedStream.headers,
-              'x-transcode': 'h264',
-            },
-          });
-          return;
-        }
-        if (!fallbackHevc()) {
-          if (isHevcSource(selectedStream)) setHevcIssue(true);
-          fail('Sumber video tidak dapat diputar.');
-        }
+        if (!fallbackHevc()) fail('Sumber video tidak dapat diputar.');
       }
     });
+    // Some decoders advance audio/time without presenting a single video frame.
+    let frameSeen = false;
+    const frameCallback = videoEl.requestVideoFrameCallback?.(() => { frameSeen = true; });
     listen(videoEl, 'ended', () => {
       if (isLive) fail('Siaran telah berhenti. Mencari saluran lain.');
     });
@@ -600,39 +565,9 @@ function PlayerSession({
         if (Math.abs(videoEl.currentTime - lastTime) > 0.05) {
           lastTime = videoEl.currentTime;
           lastProgress = now;
-          if (!isLive && videoEl.currentTime > 2 && videoEl.videoWidth === 0 && isHevcSource(selectedStream)) {
-            if (!autoSwitchedHevc.current) {
-              autoSwitchedHevc.current = true;
-              const h264Alternative = streams.find(
-                (s) => s.url !== selectedStream?.url && (!isHevcSource(s) || s.headers?.['x-transcode'] === 'h264')
-              );
-
-              if (h264Alternative) {
-                setHevcIssue(false);
-                seekOffsetRef.current = 0;
-                setSelectedStream(h264Alternative);
-                setNotice('Beralih otomatis ke format kompatibel (H.264)...');
-                setTimeout(() => setNotice(''), 4500);
-              } else if (!selectedStream?.headers?.['x-transcode']) {
-                setHevcIssue(false);
-                seekOffsetRef.current = 0;
-                const transcoded = {
-                  ...selectedStream,
-                  name: `${selectedStream.name} (H.264)`,
-                  headers: {
-                    ...selectedStream.headers,
-                    'x-transcode': 'h264',
-                  },
-                };
-                setSelectedStream(transcoded);
-                setNotice('Mengonversi otomatis ke format H.264...');
-                setTimeout(() => setNotice(''), 4500);
-              }
-            } else {
-              setHevcIssue(true);
-            }
-          } else if (videoEl.videoWidth > 0 && hevcIssue) {
-            setHevcIssue(false);
+          if (!isLive && !videoEl.seeking && document.visibilityState === 'visible' &&
+              now - startedAt >= 4000 && (videoEl.videoWidth === 0 || (frameCallback !== undefined && !frameSeen))) {
+            if (!fallbackHevc()) fail('Gambar video gagal dimuat. Mencoba sumber lain.');
           }
         } else if (now - lastProgress >= stallLimit) {
           fail('Siaran terhenti atau terlalu lama melakukan buffering.');
@@ -727,7 +662,11 @@ function PlayerSession({
         }
       })();
     } else if (kind === 'hls') {
-      if (Hls.isSupported()) {
+      const nativeHls = videoEl.canPlayType('application/vnd.apple.mpegurl');
+      if (nativeHls && /Apple/.test(navigator.vendor || '')) {
+        videoEl.src = playUrl;
+        videoEl.load();
+      } else if (Hls.isSupported()) {
         const policy = { default: { maxTimeToFirstByteMs: isTranscodedHls ? 50000 : 6000, maxLoadTimeMs: isTranscodedHls ? 55000 : 8000,
           timeoutRetry: { maxNumRetry: 1, retryDelayMs: 300, maxRetryDelayMs: 600 },
           errorRetry: { maxNumRetry: 1, retryDelayMs: 300, maxRetryDelayMs: 600 },
@@ -761,6 +700,7 @@ function PlayerSession({
     return () => {
       disposed = true;
       clearInterval(watchdog);
+      if (frameCallback !== undefined) videoEl.cancelVideoFrameCallback?.(frameCallback);
       closeHlsSession();
       listeners.forEach((remove) => remove());
       hls?.destroy();
@@ -1165,72 +1105,6 @@ function PlayerSession({
         </>
       )}
 
-      {/* HEVC Video Decoder Warning Banner (e.g. for Chromium Desktop without hardware HEVC) */}
-      {hevcIssue && !error && (
-        <div className="absolute top-3 left-3 right-3 sm:top-4 sm:left-4 sm:right-4 z-40 p-3 sm:p-4 bg-gradient-to-r from-amber-950/95 via-[#161a26]/95 to-[#10131d]/95 border border-amber-500/50 rounded-xl shadow-2xl backdrop-blur-md flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 text-white">
-          <div className="flex items-start gap-2.5">
-            <div className="p-1.5 rounded-lg bg-amber-500/20 text-amber-400 shrink-0 mt-0.5">
-              <AlertTriangle className="w-5 h-5" />
-            </div>
-            <div>
-              <div className="flex items-center gap-2 flex-wrap">
-                <h4 className="text-xs sm:text-sm font-semibold text-amber-200">
-                  Hanya Suara yang Terdengar? (Layar Hitam)
-                </h4>
-                <span className="text-[10px] bg-amber-500/30 text-amber-300 px-1.5 py-0.5 rounded font-mono font-medium">
-                  HEVC / H.265
-                </span>
-              </div>
-              <p className="text-[11px] sm:text-xs text-gray-300 mt-0.5 leading-relaxed">
-                Browser ini belum mengaktifkan akselerasi hardware video H.265. Buka di <strong>Microsoft Edge</strong>, atau putar langsung via <strong>VLC Player</strong>.
-              </p>
-            </div>
-          </div>
-          <div className="flex items-center gap-2 w-full sm:w-auto shrink-0 pt-1 sm:pt-0">
-            <button
-              onClick={() => {
-                setHevcIssue(false);
-                const h264Alternative = streams.find(
-                  (s) => s.url !== selectedStream?.url && (!isHevcSource(s) || s.headers?.['x-transcode'] === 'h264')
-                );
-                if (h264Alternative) {
-                  setSelectedStream(h264Alternative);
-                } else if (!selectedStream?.headers?.['x-transcode']) {
-                  setSelectedStream({
-                    ...selectedStream,
-                    name: `${selectedStream.name} (H.264)`,
-                    headers: {
-                      ...selectedStream.headers,
-                      'x-transcode': 'h264',
-                    },
-                  });
-                }
-              }}
-              className="flex-1 sm:flex-none flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-lg bg-[#e50914] hover:bg-[#ff2b3e] text-white text-xs font-semibold shadow-md transition-all active:scale-95"
-              title="Putar video dengan format H.264 yang didukung semua browser"
-            >
-              <Play className="w-3.5 h-3.5 fill-current" />
-              <span>Ganti ke H.264</span>
-            </button>
-            <button
-              onClick={handleCopyStreamLink}
-              className="flex-1 sm:flex-none flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-lg bg-white/10 hover:bg-white/20 text-white text-xs font-medium transition-colors"
-              title="Salin link untuk diputar di VLC / PotPlayer"
-            >
-              <Copy className="w-3.5 h-3.5" />
-              <span>{copySuccess ? 'Link Tersalin!' : 'Salin Link VLC'}</span>
-            </button>
-            <button
-              onClick={() => setHevcIssue(false)}
-              className="p-1.5 rounded-lg hover:bg-white/10 text-gray-400 hover:text-white transition-colors"
-              title="Tutup pemberitahuan"
-            >
-              <X className="w-4 h-4" />
-            </button>
-          </div>
-        </div>
-      )}
-
       {notice && !error && (
         <div role="status" className="absolute top-3 left-3 right-3 z-20 rounded-lg bg-black/85 p-3 text-xs text-white">
           {notice}
@@ -1283,52 +1157,6 @@ function PlayerSession({
               <p className="text-gray-400 text-xs mb-6 max-w-md">
                 Sumber video mungkin sedang offline atau mengalami pembatasan tautan. Silakan coba kembali atau pilih episode/kualitas lain.
               </p>
-
-              {isHevcSource(selectedStream) && (
-                <div className="mb-6 p-3 rounded-xl bg-amber-500/10 border border-amber-500/30 text-amber-200 text-xs max-w-md text-left">
-                  <div className="flex items-center gap-1.5 font-semibold text-amber-300 mb-1">
-                    <AlertTriangle className="w-4 h-4 shrink-0" />
-                    <span>Format Video HEVC (H.265)</span>
-                  </div>
-                  <p className="text-gray-300 text-[11px] mb-3 leading-relaxed">
-                    Browser ini belum mendukung format video HEVC secara native. Putar dengan mode konversi H.264 atau buka di VLC / Edge:
-                  </p>
-                  <div className="flex items-center gap-2 flex-wrap">
-                    <button
-                      onClick={() => {
-                        setError(null);
-                        setLoading(true);
-                        const h264Alternative = streams.find(
-                          (s) => s.url !== selectedStream?.url && (!isHevcSource(s) || s.headers?.['x-transcode'] === 'h264')
-                        );
-                        if (h264Alternative) {
-                          setSelectedStream(h264Alternative);
-                        } else {
-                          setSelectedStream({
-                            ...selectedStream,
-                            name: `${selectedStream.name} (H.264)`,
-                            headers: {
-                              ...selectedStream.headers,
-                              'x-transcode': 'h264',
-                            },
-                          });
-                        }
-                      }}
-                      className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-[#e50914] hover:bg-[#ff2b3e] text-white font-semibold text-xs shadow-md transition-all active:scale-95"
-                    >
-                      <Play className="w-3.5 h-3.5 fill-current" />
-                      <span>Putar via Mode H.264</span>
-                    </button>
-                    <button
-                      onClick={handleCopyStreamLink}
-                      className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-white/10 hover:bg-white/20 text-white font-medium text-xs transition-colors"
-                    >
-                      <Copy className="w-3.5 h-3.5" />
-                      <span>{copySuccess ? 'Link Tersalin!' : 'Salin Link VLC'}</span>
-                    </button>
-                  </div>
-                </div>
-              )}
 
               <div className="flex items-center gap-3">
                 <button
@@ -1573,8 +1401,8 @@ function PlayerSession({
                         <div className="flex items-center gap-1.5 text-gray-400 min-w-0">
                           <span className="text-xs font-medium text-gray-300 truncate max-w-[120px]">
                             {autoQuality
-                              ? `Auto (${selectedStream?.name || ''}${selectedStream ? ` ${getStreamCodec(selectedStream)}` : ''})`
-                              : `${selectedStream?.name || ''}${selectedStream ? ` (${getStreamCodec(selectedStream)})` : ''}`}
+                              ? `Auto (${selectedStream?.name || ''})`
+                              : selectedStream?.name}
                           </span>
                           <ChevronRight className="w-3.5 h-3.5 shrink-0" />
                         </div>
@@ -1628,8 +1456,6 @@ function PlayerSession({
                       </button>
                       {streams.map((st, idx) => {
                         const isSelected = !autoQuality && (selectedStream?.originalSource || selectedStream) === st;
-                        const codec = getStreamCodec(st);
-                        const isHevc = codec === 'HEVC';
                         return (
                           <button
                             key={idx}
@@ -1650,15 +1476,7 @@ function PlayerSession({
                               </div>
                               <span className="truncate text-left">{st.name}</span>
                             </div>
-                            <span
-                              className={`shrink-0 ml-2 text-[10px] px-1.5 py-0.5 rounded font-mono font-semibold uppercase tracking-wider border ${
-                                isHevc
-                                  ? 'bg-amber-500/15 text-amber-300 border-amber-500/30'
-                                  : 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30'
-                              }`}
-                            >
-                              {isHevc ? 'HEVC' : 'H.264'}
-                            </span>
+
                           </button>
                         );
                       })}

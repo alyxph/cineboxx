@@ -1,6 +1,6 @@
 import crypto from 'crypto';
 import { normalizeSources } from './playback.js';
-import { isHlsTranscodingEnabled } from './hls-transcode.js';
+import { isHlsPlaybackAvailable } from './hls-gateway.js';
 import { movieboxQualities, isHevcSource } from './transcode-sources.js';
 import { tabSubjects, catalogItems } from './moviebox-tabs.js';
 
@@ -1365,7 +1365,7 @@ export async function getMovieboxSource(subjectId, episodeId = '', _depth = 0) {
     }
   }
 
-  const qualities = movieboxQualities(streams, isHlsTranscodingEnabled());
+  const qualities = movieboxQualities(streams, isHlsPlaybackAvailable());
 
   if (streams.length === 0) {
     throw new Error(

@@ -1,4 +1,5 @@
 import { readHlsSegment } from '../../../../lib/hls-transcode.js';
+import { hlsGateway } from '../../../../lib/hls-gateway.js';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -10,6 +11,8 @@ const CORS_HEADERS = {
 };
 
 export async function GET(request) {
+  const gateway = await hlsGateway(request);
+  if (gateway) return gateway;
   const { searchParams } = new URL(request.url);
   const sid = searchParams.get('sid') || '';
   const file = searchParams.get('file') || '';
