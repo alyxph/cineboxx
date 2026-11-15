@@ -5,7 +5,11 @@ import { movieboxQualities, isHevcSource } from './transcode-sources.js';
 import { tabSubjects, catalogItems } from './moviebox-tabs.js';
 
 const GATEWAY_SECRET_ONLINE = '76iRl07s0xSN9jqmEWAt79EBJZulIQIsV64FZr2O';
-const BASE_URL = 'https://apig.inmoviebox.com';
+const API_HOSTS = [
+  'apig.inmoviebox.com',
+  'api.inmoviebox.com',
+  'api.aoneroom.com',
+];
 
 // Global state to persist token across serverless invocations and dev reloads
 const globalMovieboxState = globalThis.__movieboxState || (globalThis.__movieboxState = {
@@ -13,9 +17,12 @@ const globalMovieboxState = globalThis.__movieboxState || (globalThis.__moviebox
   userId: null,
   tokenExpiry: 0,
   visitorPromise: null,
+  activeHost: API_HOSTS[0],
   cache: new Map(),
   inFlight: new Map(),
 });
+
+const getActiveHost = () => globalMovieboxState.activeHost || API_HOSTS[0];
 
 const cache = globalMovieboxState.cache;
 const inFlight = globalMovieboxState.inFlight;
@@ -147,9 +154,10 @@ export async function getVisitorToken(force = false) {
       // If user provided account credentials in .env, authenticate as real user
       if (mbEmail && mbPass) {
         try {
+          const activeHost = getActiveHost();
           const loginEndpoint = '/wefeed-mobile-bff/user-api/login';
-          const loginUrl = new URL(`${BASE_URL}${loginEndpoint}`);
-          loginUrl.searchParams.set('host', 'apig.inmoviebox.com');
+          const loginUrl = new URL(`https://${activeHost}${loginEndpoint}`);
+          loginUrl.searchParams.set('host', activeHost);
           const loginBody = JSON.stringify({
             password: md5Hex(mbPass),
             package_name: 'com.community.oneroom',
@@ -164,7 +172,7 @@ export async function getVisitorToken(force = false) {
             'Accept': 'application/json',
             'Content-Type': 'application/json;charset=UTF-8',
             'X-M-Version': '4.0.02',
-            'Referer': 'https://apig.inmoviebox.com/',
+            'Referer': `https://${activeHost}/`,
             'X-Sign-Version': '2.0',
             'X-Client-Token': generateClientToken(),
             'X-Client-Info': JSON.stringify(getDeviceClientInfo()),
@@ -198,64 +206,71 @@ export async function getVisitorToken(force = false) {
         }
       }
 
-      // Default visitor login
+      // Default visitor login with automatic host failover
       const endpoint = '/wefeed-mobile-bff/user-api/visitor-login';
-      const urlObj = new URL(`${BASE_URL}${endpoint}`);
-      urlObj.searchParams.set('host', 'apig.inmoviebox.com');
+      const currentHost = getActiveHost();
+      const hostsToTry = [currentHost, ...API_HOSTS.filter((h) => h !== currentHost)];
 
-      const ts = Date.now();
-      const bodyStr = '{}';
-      const sig = generateTrSignature('POST', urlObj.toString(), bodyStr, ts);
+      for (const host of hostsToTry) {
+        try {
+          const urlObj = new URL(`https://${host}${endpoint}`);
+          urlObj.searchParams.set('host', host);
 
-      const headers = {
-        'User-Agent': 'MovieBox/4.0.02 (Android 14; Pixel 6)',
-        'Accept': 'application/json',
-        'Content-Type': 'application/json;charset=UTF-8',
-        'X-M-Version': '4.0.02',
-        'Referer': 'https://apig.inmoviebox.com/',
-        'X-Sign-Version': '2.0',
-        'X-Client-Token': generateClientToken(),
-        'X-Client-Info': JSON.stringify(getDeviceClientInfo()),
-        'X-Client-Status': '1',
-        'X-Play-Mode': '2',
-        'appid': '4U01pxRu278GqCZKY9',
-        'region': 'IN',
-        'lang': 'en',
-        'os': 'android',
-        'X-Timestamp': String(ts),
-        'x-tr-signature': sig,
-      };
+          const ts = Date.now();
+          const bodyStr = '{}';
+          const sig = generateTrSignature('POST', urlObj.toString(), bodyStr, ts);
 
-      const res = await fetch(urlObj.toString(), {
-        method: 'POST',
-        headers,
-        body: bodyStr,
-        cache: 'no-store',
-        signal: AbortSignal.timeout(10000),
-      });
+          const headers = {
+            'User-Agent': 'MovieBox/4.0.02 (Android 14; Pixel 6)',
+            'Accept': 'application/json',
+            'Content-Type': 'application/json;charset=UTF-8',
+            'X-M-Version': '4.0.02',
+            'Referer': `https://${host}/`,
+            'X-Sign-Version': '2.0',
+            'X-Client-Token': generateClientToken(),
+            'X-Client-Info': JSON.stringify(getDeviceClientInfo()),
+            'X-Client-Status': '1',
+            'X-Play-Mode': '2',
+            'appid': '4U01pxRu278GqCZKY9',
+            'region': 'IN',
+            'lang': 'en',
+            'os': 'android',
+            'X-Timestamp': String(ts),
+            'x-tr-signature': sig,
+          };
 
-      const json = await res.json();
-      if (res.ok && [0, 200].includes(Number(json.code)) && json.data?.token) {
-        globalMovieboxState.token = json.data.token;
-        globalMovieboxState.userId = String(json.data.userId || json.data.uid || '');
-        // Cache token for 24 hours (tokens typically last 30 days)
-        globalMovieboxState.tokenExpiry = Date.now() + 24 * 60 * 60 * 1000;
-        console.log('[MovieBox] Visitor login successful. User:', globalMovieboxState.userId);
-        return globalMovieboxState.token;
+          const res = await fetch(urlObj.toString(), {
+            method: 'POST',
+            headers,
+            body: bodyStr,
+            cache: 'no-store',
+            signal: AbortSignal.timeout(8000),
+          });
+
+          const json = await res.json();
+          if (res.ok && [0, 200].includes(Number(json.code)) && json.data?.token) {
+            globalMovieboxState.activeHost = host;
+            globalMovieboxState.token = json.data.token;
+            globalMovieboxState.userId = String(json.data.userId || json.data.uid || '');
+            // Cache token for 24 hours (tokens typically last 30 days)
+            globalMovieboxState.tokenExpiry = Date.now() + 24 * 60 * 60 * 1000;
+            console.log('[MovieBox] Visitor login successful. User:', globalMovieboxState.userId);
+            return globalMovieboxState.token;
+          }
+          const code = /^\d+$/.test(String(json?.code)) ? Number(json.code) : undefined;
+          const message = String(json?.message || json?.msg || '');
+          const reason = /signature|signing/i.test(message) ? 'validasi signature'
+            : /appid|appkey|app_id|app_key/i.test(message) ? 'identitas aplikasi'
+              : /token|jwt|session/i.test(message) ? 'autentikasi'
+                : /\bip\b|region|country|blocked/i.test(message) ? 'kebijakan akses' : '';
+          globalMovieboxState.authFailure = { status: res.status, code, reason };
+          console.warn('[MovieBox] Visitor login failed', { host, ...globalMovieboxState.authFailure });
+        } catch (err) {
+          globalMovieboxState.authFailure = { reason: ['TimeoutError', 'AbortError'].includes(err.name)
+            ? 'timeout' : err instanceof SyntaxError ? 'respons non-JSON' : 'koneksi gagal' };
+          console.error('[MovieBox] Visitor login error', { host, ...globalMovieboxState.authFailure });
+        }
       }
-      const code = /^\d+$/.test(String(json?.code)) ? Number(json.code) : undefined;
-      const message = String(json?.message || json?.msg || '');
-      const reason = /signature|signing/i.test(message) ? 'validasi signature'
-        : /appid|appkey|app_id|app_key/i.test(message) ? 'identitas aplikasi'
-          : /token|jwt|session/i.test(message) ? 'autentikasi'
-            : /\bip\b|region|country|blocked/i.test(message) ? 'kebijakan akses' : '';
-      globalMovieboxState.authFailure = { status: res.status, code, reason };
-      console.warn('[MovieBox] Visitor login failed', globalMovieboxState.authFailure);
-      return null;
-    } catch (err) {
-      globalMovieboxState.authFailure = { reason: ['TimeoutError', 'AbortError'].includes(err.name)
-        ? 'timeout' : err instanceof SyntaxError ? 'respons non-JSON' : 'koneksi gagal' };
-      console.error('[MovieBox] Visitor login error', globalMovieboxState.authFailure);
       return null;
     } finally {
       globalMovieboxState.visitorPromise = null;
@@ -272,8 +287,9 @@ export async function movieboxRequest(method, endpoint, params = {}, body = null
   let token = await getVisitorToken();
 
   const makeCall = async (authToken) => {
-    const urlObj = new URL(`${BASE_URL}${endpoint}`);
-    urlObj.searchParams.set('host', 'apig.inmoviebox.com');
+    const activeHost = getActiveHost();
+    const urlObj = new URL(`https://${activeHost}${endpoint}`);
+    urlObj.searchParams.set('host', activeHost);
     for (const [k, v] of Object.entries(params)) {
       if (v !== undefined && v !== null) {
         urlObj.searchParams.set(k, String(v));
@@ -289,7 +305,7 @@ export async function movieboxRequest(method, endpoint, params = {}, body = null
       'Accept': 'application/json',
       'Content-Type': 'application/json;charset=UTF-8',
       'X-M-Version': '4.0.02',
-      'Referer': 'https://apig.inmoviebox.com/',
+      'Referer': `https://${activeHost}/`,
       'X-Sign-Version': '2.0',
       'X-Client-Token': generateClientToken(),
       'X-Client-Info': JSON.stringify(getDeviceClientInfo()),
