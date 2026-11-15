@@ -957,7 +957,7 @@ export async function getMovieboxSource(subjectId, episodeId = '') {
   const subtitles = [];
   const seenUrls = new Set();
 
-  const addStream = (url, name, format, customHeaders = null) => {
+  const addStream = (url, name, format, customHeaders = null, sourceCodec = null) => {
     if (!url) return;
     // Reject dummy preview/sample placeholder files (< 1MB samples)
     if (url.includes('macdn.aoneroom.com/other/') || url.includes('80da52722ee7de7a4303290af6783424')) {
@@ -972,11 +972,14 @@ export async function getMovieboxSource(subjectId, episodeId = '') {
       'User-Agent': 'MovieBox/4.0.02 (Android 14; Pixel 6)',
     };
 
+    const determinedCodec = sourceCodec || (isHevcSource({ name, url }) ? 'hevc' : 'h264');
+
     streams.push({
       url,
       name,
       format,
       headers: streamHeaders,
+      sourceCodec: determinedCodec,
     });
   };
 
@@ -1327,12 +1330,13 @@ export async function getMovieboxSource(subjectId, episodeId = '') {
   // If the title is a dubbed version (e.g. [Hindi]) or only HEVC streams exist,
   // query the original standard title to grab native H.264 streams
   const hasDubMarker = /\[.*?\]/i.test(detail?.title || '');
-  const hasOnlyHevc = streams.every((s) => /hevc|h265/i.test(s.name) || s.headers?.['x-transcode']);
+  const hasOnlyHevc = streams.length > 0 && streams.every((s) => isHevcSource(s) || s.headers?.['x-transcode']);
 
   if ((hasDubMarker || hasOnlyHevc) && detail?.title) {
     try {
       const cleanTitle = detail.title.replace(/\[.*?\]|\(.*?\)/g, '').trim();
-      if (cleanTitle && cleanTitle.length >= 2 && cleanTitle.toLowerCase() !== detail.title.toLowerCase()) {
+      const shouldSearch = cleanTitle && cleanTitle.length >= 2 && (hasOnlyHevc || cleanTitle.toLowerCase() !== detail.title.toLowerCase());
+      if (shouldSearch) {
         const altSearch = await searchMoviebox(cleanTitle);
         const altVideo = (altSearch?.videos || []).find(
           (v) => String(v.id) !== String(subjectId) && v.title.toLowerCase().includes(cleanTitle.toLowerCase())
@@ -1344,7 +1348,12 @@ export async function getMovieboxSource(subjectId, episodeId = '') {
           for (const st of altSrc.streams || []) {
             const isAltH264 = !isHevcSource(st) && !st.headers?.['x-transcode'];
             if (isAltH264) {
-              addStream(st.url, `${st.name} (Versi Standar)`, st.format, st.headers);
+              addStream(st.url, `${st.name}`, st.format, st.headers, 'h264');
+            }
+          }
+          for (const sub of altSrc.subtitles || []) {
+            if (sub.url && !subtitles.some((s) => s.url === sub.url || s.name === sub.name)) {
+              subtitles.push(sub);
             }
           }
         }

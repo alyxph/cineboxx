@@ -28,13 +28,14 @@ export function initialQuality(streams, connection, supportsHevc = true) {
   const ladder = qualityLadder(streams);
   if (!ladder.length) return streams[0];
 
-  // If the browser does not support HEVC, prioritize native H.264 streams
-  const compatible = !supportsHevc ? ladder.filter((s) => !isHevcSource(s)) : ladder;
-  const pool = compatible.length > 0 ? compatible : ladder;
+  // If the browser does not support HEVC or standard streams exist, prioritize native H.264 streams
+  const h264Streams = ladder.filter((s) => !isHevcSource(s));
+  const pool = (!supportsHevc || h264Streams.length > 0) ? h264Streams : ladder;
+  const candidates = pool.length > 0 ? pool : ladder;
 
   const budget = networkBudget(connection);
-  const fits = pool.filter((s) => budget === null ? sourceResolution(s) <= 480 : requiredMbps(s) <= budget);
-  return fits.at(-1) || pool[0];
+  const fits = candidates.filter((s) => budget === null ? sourceResolution(s) <= 480 : requiredMbps(s) <= budget);
+  return fits.at(-1) || candidates[0];
 }
 
 export function adaptiveQuality({ streams, current, connection, bufferAhead, waitingMs,

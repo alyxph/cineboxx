@@ -3,7 +3,7 @@
 import { useState, useEffect, useRef, useCallback, useEffectEvent } from 'react';
 import Hls from 'hls.js';
 import { initialQuality, adaptiveQuality, qualityLadder } from '@/lib/adaptive-quality';
-import { browserSupportsHevc, isHevcSource, playbackSource, sourceResolution } from '@/lib/transcode-sources';
+import { browserSupportsHevc, isHevcSource, playbackSource, sourceResolution, getStreamCodec } from '@/lib/transcode-sources';
 import {
   Play,
   Pause,
@@ -179,15 +179,21 @@ function PlayerSession({
     const next = !offline && reason === 'unavailable'
       ? (() => {
           const available = streams.filter((stream) => !failedStreams.current.has(stream));
+          if (!available.length) return null;
+          // If the failed stream was HEVC, immediately prioritize any available native H.264 stream
+          if (isHevcSource(selectedStream)) {
+            const h264Fallback = available.find((s) => !isHevcSource(s));
+            if (h264Fallback) return h264Fallback;
+          }
           const height = Number(selectedStream?.resolution) || Number(selectedStream?.name?.match(/(\d+)p/i)?.[1]) || 0;
           if (!isLive && height) {
             const lower = qualityLadder(available).filter((stream) => (Number(stream.resolution) || Number(stream.name?.match(/(\d+)p/i)?.[1]) || 0) < height);
-            return autoQuality ? lower.at(-1) : null;
+            if (autoQuality && lower.length > 0) return lower.at(-1);
           }
           return available[0];
         })()
       : null;
-    if (next && failedStreams.current.size < (isLive ? 2 : 3)) {
+    if (next && failedStreams.current.size < (isLive ? 2 : 4)) {
       setNotice('Sumber bermasalah. Mencoba sumber video lain...');
       setLoading(true);
       setBuffering(false);
@@ -1049,6 +1055,8 @@ function PlayerSession({
               }
             }}
             playsInline
+            webkit-playsinline="true"
+            x5-playsinline="true"
           />
           {/* Synchronized Audio Track for Separate Streams (e.g. Bstation DASH) */}
           <audio
@@ -1334,7 +1342,7 @@ function PlayerSession({
 
             {/* Settings Pop-up Menu */}
             {showSettingsMenu && (
-              <div className="absolute right-4 sm:right-14 bottom-14 w-56 bg-[#12151f]/95 border border-white/10 rounded-xl shadow-2xl p-2 z-50">
+              <div className="absolute right-4 sm:right-14 bottom-14 w-60 bg-[#12151f]/95 border border-white/10 rounded-xl shadow-2xl p-2 z-50">
                 {settingsTab === 'main' && (
                   <div className="space-y-1">
                     <p className="text-xs font-semibold text-gray-300 px-3 py-1.5 border-b border-white/10">
@@ -1351,11 +1359,13 @@ function PlayerSession({
                           <Settings className="w-4 h-4 text-gray-400" />
                           <span>Kualitas</span>
                         </div>
-                        <div className="flex items-center gap-1 text-gray-400">
-                          <span className="text-xs font-medium text-gray-300 truncate max-w-[80px]">
-                            {autoQuality ? `Auto (${selectedStream?.name || ''})` : selectedStream?.name}
+                        <div className="flex items-center gap-1.5 text-gray-400 min-w-0">
+                          <span className="text-xs font-medium text-gray-300 truncate max-w-[120px]">
+                            {autoQuality
+                              ? `Auto (${selectedStream?.name || ''}${selectedStream ? ` ${getStreamCodec(selectedStream)}` : ''})`
+                              : `${selectedStream?.name || ''}${selectedStream ? ` (${getStreamCodec(selectedStream)})` : ''}`}
                           </span>
-                          <ChevronRight className="w-3.5 h-3.5" />
+                          <ChevronRight className="w-3.5 h-3.5 shrink-0" />
                         </div>
                       </button>
                     )}
@@ -1389,17 +1399,26 @@ function PlayerSession({
                       <span>Kualitas Video</span>
                     </button>
                     <div className="max-h-56 overflow-y-auto py-1 space-y-0.5">
-                      <button onClick={() => {
-                        qualityPreference.current.mode = 'auto';
-                        setAutoQuality(true);
-                        qualityHealth.current = { changedAt: Date.now(), stableSince: Date.now(), waitingSince: 0 };
-                        setShowSettingsMenu(false); setSettingsTab('main');
-                      }} className="w-full flex items-center gap-2.5 px-3 py-2 rounded-lg text-xs text-gray-200 hover:bg-white/10">
-                        <span className="w-4 h-4">{autoQuality && <Check className="w-4 h-4" />}</span>
-                        <span>Auto</span>
+                      <button
+                        onClick={() => {
+                          qualityPreference.current.mode = 'auto';
+                          setAutoQuality(true);
+                          qualityHealth.current = { changedAt: Date.now(), stableSince: Date.now(), waitingSince: 0 };
+                          setShowSettingsMenu(false);
+                          setSettingsTab('main');
+                        }}
+                        className="w-full flex items-center justify-between px-3 py-2 rounded-lg text-xs text-gray-200 hover:bg-white/10"
+                      >
+                        <div className="flex items-center gap-2.5">
+                          <span className="w-4 h-4">{autoQuality && <Check className="w-4 h-4" />}</span>
+                          <span>Auto</span>
+                        </div>
+                        <span className="text-[10px] text-gray-400 font-mono">Adaptif</span>
                       </button>
                       {streams.map((st, idx) => {
                         const isSelected = !autoQuality && (selectedStream?.originalSource || selectedStream) === st;
+                        const codec = getStreamCodec(st);
+                        const isHevc = codec === 'HEVC';
                         return (
                           <button
                             key={idx}
@@ -1408,16 +1427,27 @@ function PlayerSession({
                               setShowSettingsMenu(false);
                               setSettingsTab('main');
                             }}
-                            className={`w-full flex items-center gap-2.5 px-3 py-2 rounded-lg text-xs transition-colors ${
+                            className={`w-full flex items-center justify-between px-3 py-2 rounded-lg text-xs transition-colors ${
                               isSelected
                                 ? 'bg-white/15 text-white font-semibold'
                                 : 'text-gray-300 font-medium hover:bg-white/10'
                             }`}
                           >
-                            <div className="w-4 h-4 flex items-center justify-center shrink-0">
-                              {isSelected && <Check className="w-4 h-4 text-white" />}
+                            <div className="flex items-center gap-2.5 min-w-0">
+                              <div className="w-4 h-4 flex items-center justify-center shrink-0">
+                                {isSelected && <Check className="w-4 h-4 text-white" />}
+                              </div>
+                              <span className="truncate text-left">{st.name}</span>
                             </div>
-                            <span className="truncate text-left flex-1">{st.name}</span>
+                            <span
+                              className={`shrink-0 ml-2 text-[10px] px-1.5 py-0.5 rounded font-mono font-semibold uppercase tracking-wider border ${
+                                isHevc
+                                  ? 'bg-amber-500/15 text-amber-300 border-amber-500/30'
+                                  : 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30'
+                              }`}
+                            >
+                              {isHevc ? 'HEVC' : 'H.264'}
+                            </span>
                           </button>
                         );
                       })}

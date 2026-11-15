@@ -290,6 +290,8 @@ export async function GET(request) {
 
     if (isMpd) {
       responseHeaders.set('Content-Type', 'application/dash+xml');
+    } else if ((!contentType || contentType.includes('application/octet-stream') || contentType.includes('binary/octet-stream')) && /\.mp4($|\?)/i.test(targetUrl)) {
+      responseHeaders.set('Content-Type', 'video/mp4');
     } else {
       responseHeaders.set('Content-Type', contentType);
     }
@@ -323,3 +325,5 @@ export async function OPTIONS() {
     },
   });
 }
+
+export const HEAD = GET;

@@ -1,5 +1,15 @@
-export const sourceResolution = (stream) => Number(stream.resolution) || Number(String(stream.name || '').match(/(\d+)p/i)?.[1]) || 0;
-export const isHevcSource = (stream) => stream.sourceCodec === 'hevc' || /hevc|h\.?265/i.test(`${stream.name || ''} ${stream.url || ''}`);
+export const sourceResolution = (stream) => Number(stream?.resolution) || Number(String(stream?.name || '').match(/(\d+)p/i)?.[1]) || 0;
+
+export const isHevcSource = (stream) => Boolean(stream && (stream.sourceCodec === 'hevc' || /hevc|h\.?265/i.test(`${stream.name || ''} ${stream.url || ''}`)));
+
+export const getStreamCodec = (stream) => {
+  if (!stream) return 'H.264';
+  if (isHevcSource(stream)) return 'HEVC';
+  if (stream.format === 'iframe') return 'Embed';
+  if (stream.format === 'hls' || stream.url?.includes('.m3u8')) return 'HLS';
+  if (stream.format === 'dash' || stream.url?.includes('.mpd')) return 'DASH';
+  return 'H.264';
+};
 
 // One entry per supplied quality; codec handling belongs to playback.
 export function movieboxQualities(streams, transcodeAllowed = true) {
@@ -7,12 +17,19 @@ export function movieboxQualities(streams, transcodeAllowed = true) {
   for (const stream of streams) {
     if (stream.headers?.['x-transcode']) continue;
     const height = sourceResolution(stream);
-    const sourceCodec = isHevcSource(stream) ? 'hevc' : (/h\.?264|avc/i.test(stream.name || '') ? 'h264' : '');
-    const candidate = { ...stream, resolution: height, sourceCodec, transcodeAllowed,
-      name: height ? `${height}p` : stream.name };
+    const sourceCodec = isHevcSource(stream) ? 'hevc' : 'h264';
+    const candidate = {
+      ...stream,
+      resolution: height,
+      sourceCodec,
+      transcodeAllowed,
+      name: height ? `${height}p` : stream.name,
+    };
     const key = height || stream.url;
     const existing = qualities.get(key);
-    if (!existing || (existing.sourceCodec === 'hevc' && sourceCodec !== 'hevc')) qualities.set(key, candidate);
+    if (!existing || (existing.sourceCodec === 'hevc' && sourceCodec !== 'hevc')) {
+      qualities.set(key, candidate);
+    }
   }
   return [...qualities.values()].sort((a, b) => b.resolution - a.resolution);
 }
