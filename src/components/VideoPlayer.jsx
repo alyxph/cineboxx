@@ -25,10 +25,10 @@ import {
   Tv,
   Film,
 } from 'lucide-react';
-import { saveProgress, getProgress } from '@/lib/storage';
+import { saveProgress, getProgress, getSubtitleDelay, saveSubtitleDelay } from '@/lib/storage';
 import { fetchJson } from '@/lib/http';
 import { isLiveVideo, streamKind, proxyUrl, normalizeSources, createHlsSessionId, LIVE_SOURCE_TIMEOUT, LIVE_START_TIMEOUT, LIVE_STALL_TIMEOUT } from '@/lib/playback';
-import { parseSubtitleText } from '@/lib/subtitles';
+import { parseSubtitleText, subtitleTextAt } from '@/lib/subtitles';
 
 const RECOMMENDED_MOVIES = [
   {
@@ -139,6 +139,7 @@ function PlayerSession({
   const [selectedSubtitle, setSelectedSubtitle] = useState(null);
   const [subtitleCues, setSubtitleCues] = useState([]);
   const [currentSubtitleText, setCurrentSubtitleText] = useState('');
+  const [subtitleDelay, setSubtitleDelay] = useState(0);
 
   // Player controls state
   const [isPlaying, setIsPlaying] = useState(false);
@@ -285,6 +286,7 @@ function PlayerSession({
     setSelectedSubtitle(null);
     setSubtitleCues([]);
     setCurrentSubtitleText('');
+    setSubtitleDelay(0);
   });
   useEffect(() => {
     const controller = new AbortController();
@@ -321,7 +323,9 @@ function PlayerSession({
           setKnownDuration(data.duration);
         }
         setSubtitles(data.subtitles);
-        setSelectedSubtitle(data.subtitles.find((sub) => /indonesia|\b(id|ina)\b/i.test(sub.name)) || data.subtitles[0] || null);
+        const preferredSubtitle = data.subtitles.find((sub) => /indonesia|\b(id|ina)\b/i.test(sub.name)) || data.subtitles[0] || null;
+        setSelectedSubtitle(preferredSubtitle);
+        setSubtitleDelay(getSubtitleDelay(video.id, episode?.id, preferredSubtitle?.name));
       } catch (error) {
         if (!controller.signal.aborted) failStream(error.message || 'Gagal memuat sumber video.');
       }
@@ -752,12 +756,10 @@ function PlayerSession({
       saveProgress(video.id, episode?.id, totalTime, effectiveDuration);
     }
 
-    // Subtitle matching
+    // Subtitle matching always uses the absolute movie timeline. A positive
+    // subtitle delay means "show this cue later".
     if (selectedSubtitle && subtitleCues.length > 0) {
-      const isTranscoded = selectedStream?.headers?.['x-transcode'] === 'h264';
-      const subTime = isTranscoded ? totalTime : time;
-      const match = subtitleCues.find((c) => subTime >= c.start && subTime <= c.end);
-      setCurrentSubtitleText(match ? match.text : '');
+      setCurrentSubtitleText(subtitleTextAt(subtitleCues, totalTime, subtitleDelay));
     } else {
       setCurrentSubtitleText('');
     }
@@ -1329,17 +1331,57 @@ function PlayerSession({
 
             {/* Subtitle Pop-up Menu */}
             {showSubtitleMenu && subtitles.length > 0 && (
-              <div className="absolute right-4 sm:right-24 bottom-14 w-56 bg-[#12151f]/95 border border-white/10 rounded-xl shadow-2xl p-2 z-50">
+              <div className="absolute right-2 sm:right-24 bottom-14 w-64 bg-[#12151f]/95 border border-white/10 rounded-xl shadow-2xl p-2 z-50">
                 <div className="px-3 py-2 border-b border-white/10 flex items-center justify-between">
                   <span className="text-xs font-semibold text-gray-200">Subtitle</span>
                   <span className="text-xs text-gray-400 truncate max-w-[100px]">
                     {selectedSubtitle ? selectedSubtitle.name : 'Nonaktif'}
                   </span>
                 </div>
+                {selectedSubtitle && (
+                  <div className="px-2 py-2 border-b border-white/10">
+                    <div className="flex items-center justify-between gap-2 mb-1.5">
+                      <span className="text-[11px] font-medium text-gray-300">Sinkronisasi</span>
+                      <button
+                        onClick={() => {
+                          setSubtitleDelay(0);
+                          saveSubtitleDelay(video.id, episode?.id, selectedSubtitle.name, 0);
+                        }}
+                        className="text-[10px] text-gray-400 hover:text-white"
+                      >
+                        {subtitleDelay === 0 ? 'Pas' : `${subtitleDelay > 0 ? '+' : ''}${subtitleDelay.toFixed(1)} dtk · Reset`}
+                      </button>
+                    </div>
+                    <div className="grid grid-cols-2 gap-1.5">
+                      <button
+                        onClick={() => {
+                          const next = Math.min(30, subtitleDelay + 0.5);
+                          setSubtitleDelay(next);
+                          saveSubtitleDelay(video.id, episode?.id, selectedSubtitle.name, next);
+                        }}
+                        className="rounded-md bg-white/10 px-2 py-1.5 text-[10px] text-gray-200 hover:bg-white/15"
+                        title="Gunakan jika subtitle muncul sebelum suara"
+                      >
+                        Lebih lambat +0,5
+                      </button>
+                      <button
+                        onClick={() => {
+                          const next = Math.max(-30, subtitleDelay - 0.5);
+                          setSubtitleDelay(next);
+                          saveSubtitleDelay(video.id, episode?.id, selectedSubtitle.name, next);
+                        }}
+                        className="rounded-md bg-white/10 px-2 py-1.5 text-[10px] text-gray-200 hover:bg-white/15"
+                        title="Gunakan jika subtitle muncul setelah suara"
+                      >
+                        Lebih cepat −0,5
+                      </button>
+                    </div>
+                  </div>
+                )}
                 <div className="max-h-60 overflow-y-auto py-1 space-y-0.5">
                   <button
                     onClick={() => {
-                      setSelectedSubtitle(null); setSubtitleCues([]); setCurrentSubtitleText('');
+                      setSelectedSubtitle(null); setSubtitleCues([]); setCurrentSubtitleText(''); setSubtitleDelay(0);
                       setShowSubtitleMenu(false);
                     }}
                     className={`w-full flex items-center gap-2.5 px-3 py-2 rounded-lg text-xs transition-colors ${
@@ -1360,6 +1402,7 @@ function PlayerSession({
                         key={idx}
                         onClick={() => {
                           setSelectedSubtitle(sub); setSubtitleCues([]); setCurrentSubtitleText('');
+                          setSubtitleDelay(getSubtitleDelay(video.id, episode?.id, sub.name));
                           setShowSubtitleMenu(false);
                         }}
                         className={`w-full flex items-center gap-2.5 px-3 py-2 rounded-lg text-xs transition-colors ${

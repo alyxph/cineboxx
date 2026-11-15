@@ -158,3 +158,25 @@ test('a loaded external player is not falsely reported as unresponsive', async (
   await page.waitForTimeout(13000);
   await expect(page.getByText(/Pemutar eksternal belum merespons/)).toHaveCount(0);
 });
+
+test('subtitle sync can be delayed and remains saved for the movie', async ({ page }) => {
+  await mockApi(page, () => ({ success: true, data: {
+    streams: [{ url: 'https://media.example/test.webm', format: 'webm' }],
+    subtitles: [{ name: 'Indonesia', url: 'https://media.example/id.vtt' }],
+  } }));
+  await page.route('**/api/stream?**', (route) => {
+    const target = new URL(route.request().url()).searchParams.get('url');
+    return target?.endsWith('/id.vtt')
+      ? route.fulfill({ contentType: 'text/vtt', body: 'WEBVTT\n\n00:00.000 --> 00:30.000\nHalo' })
+      : route.fulfill({ contentType: 'video/webm', body: fixture });
+  });
+  await page.goto(watch('subtitle-sync', false));
+  await expect(page.getByText('Halo', { exact: true })).toBeVisible();
+  await page.getByTitle('Subtitle (CC)').click();
+  await page.getByRole('button', { name: 'Lebih lambat +0,5' }).click();
+  await page.getByRole('button', { name: 'Lebih lambat +0,5' }).click();
+  await expect(page.getByRole('button', { name: /\+1\.0 dtk · Reset/ })).toBeVisible();
+  await page.reload();
+  await page.getByTitle('Subtitle (CC)').click();
+  await expect(page.getByRole('button', { name: /\+1\.0 dtk · Reset/ })).toBeVisible();
+});

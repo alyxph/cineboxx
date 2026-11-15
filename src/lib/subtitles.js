@@ -3,6 +3,12 @@ export function parseSubtitleText(content) {
     const list = [];
     if (!content) return list;
     const clean = content.replace(/\r/g, '').trim();
+    const map = clean.match(/X-TIMESTAMP-MAP\s*=\s*LOCAL:([^,\s]+)\s*,\s*MPEGTS:(\d+)/i);
+    const mapOffset = map ? Number(map[2]) / 90000 - parseTimestamp(map[1]) : 0;
+    const finish = () => list
+      .map((cue) => ({ ...cue, start: cue.start + mapOffset, end: cue.end + mapOffset }))
+      .filter((cue) => Number.isFinite(cue.start) && Number.isFinite(cue.end) && cue.end >= cue.start)
+      .sort((a, b) => a.start - b.start || a.end - b.end);
 
     // Check if Bilibili JSON format
     if (clean.startsWith('{')) {
@@ -17,7 +23,7 @@ export function parseSubtitleText(content) {
               list.push({ start, end, text });
             }
           }
-          if (list.length > 0) return list;
+          if (list.length > 0) return finish();
         }
       } catch {}
     }
@@ -38,7 +44,7 @@ export function parseSubtitleText(content) {
           }
         }
       }
-      if (list.length > 0) return list;
+      if (list.length > 0) return finish();
     }
 
     // Standard WebVTT / SRT parser
@@ -67,8 +73,29 @@ export function parseSubtitleText(content) {
         list.push({ start, end, text });
       }
     }
-    return list;
+    return finish();
   }
+
+// Positive delay intentionally shows a cue later. playbackTime is always the
+// absolute movie timeline, including a fragmented-transcode seek offset.
+export function subtitleTextAt(cues, playbackTime, delaySeconds = 0) {
+  if (!Array.isArray(cues) || !Number.isFinite(playbackTime)) return '';
+  const cueTime = playbackTime - (Number.isFinite(delaySeconds) ? delaySeconds : 0);
+  let low = 0;
+  let high = cues.length - 1;
+  let candidate = -1;
+  while (low <= high) {
+    const mid = (low + high) >> 1;
+    if (cues[mid].start <= cueTime) { candidate = mid; low = mid + 1; }
+    else high = mid - 1;
+  }
+  // A few subtitle files contain overlapping cues; prefer the newest active one.
+  for (let index = candidate; index >= 0 && cues[index].start <= cueTime; index--) {
+    if (cueTime <= cues[index].end) return cues[index].text || '';
+    if (candidate - index > 8) break;
+  }
+  return '';
+}
 
   function parseTimestamp(t) {
     const parts = t.replace(',', '.').split(':');

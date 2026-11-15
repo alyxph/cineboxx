@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { normalizeSources, streamKind, isLiveVideo, nextAvailableChannel, proxyUrl } from '../src/lib/playback.js';
 import { fetchJson } from '../src/lib/http.js';
-import { parseSubtitleText } from '../src/lib/subtitles.js';
+import { parseSubtitleText, subtitleTextAt } from '../src/lib/subtitles.js';
 
 test('malformed source entries do not crash or permit non-media protocols', () => {
   const result = normalizeSources({ streams: [null, {}, 'javascript:alert(1)', { url: 42 }, { url: 'https://cdn.example/video.mp4' }], subtitles: [null, { url: 'https://cdn.example/id.vtt' }] });
@@ -76,4 +76,13 @@ test('API invalid JSON and unsuccessful responses have actionable errors', async
 test('SRT and WebVTT subtitles parse timing and remove markup', () => {
   assert.deepEqual(parseSubtitleText('WEBVTT\n\n00:01.500 --> 00:03.000 align:start\n<b>Halo</b>'), [{ start: 1.5, end: 3, text: 'Halo' }]);
   assert.deepEqual(parseSubtitleText('1\n00:00:01,000 --> 00:00:02,000\nHalo'), [{ start: 1, end: 2, text: 'Halo' }]);
+});
+
+test('subtitle timing honors WebVTT timestamp maps and a saved viewer delay', () => {
+  const cues = parseSubtitleText('WEBVTT\nX-TIMESTAMP-MAP=LOCAL:00:00:00.000,MPEGTS:900000\n\n00:01.000 --> 00:03.000\nHalo');
+  assert.deepEqual(cues, [{ start: 11, end: 13, text: 'Halo' }]);
+  assert.equal(subtitleTextAt(cues, 11.5), 'Halo');
+  assert.equal(subtitleTextAt(cues, 11.5, 2), '');
+  assert.equal(subtitleTextAt(cues, 13.5, 2), 'Halo');
+  assert.equal(subtitleTextAt(cues, 9.5, -2), 'Halo');
 });
