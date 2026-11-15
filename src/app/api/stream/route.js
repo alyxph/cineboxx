@@ -166,7 +166,8 @@ export async function GET(request) {
         const start = parseInt(match[1], 10);
         const hasEnd = Boolean(match[2]);
         const size = start === 0 ? INITIAL_CHUNK_SIZE : CHUNK_SIZE;
-        const end = hasEnd ? parseInt(match[2], 10) : start + size - 1;
+        const maxEnd = start + size - 1;
+        const end = hasEnd ? Math.min(parseInt(match[2], 10), maxEnd) : maxEnd;
         headers['Range'] = `bytes=${start}-${end}`;
       } else {
         headers['Range'] = range;

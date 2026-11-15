@@ -56,6 +56,23 @@ test('Range requests and 416 responses preserve seeking semantics', async () => 
   } finally { globalThis.fetch = original; }
 });
 
+test('Oversized range requests like iOS Safari bytes=0-999999999 are clamped to safe serverless chunk size', async () => {
+  const original = globalThis.fetch;
+  let capturedRange = '';
+  globalThis.fetch = async (_, options) => {
+    capturedRange = options.headers.Range;
+    return new Response(new Uint8Array([1, 2, 3]), {
+      status: 206,
+      headers: { 'Content-Range': 'bytes 0-2/1000000000', 'Content-Type': 'video/mp4' },
+    });
+  };
+  try {
+    const response = await GET(request('https://93.184.216.34/video.mp4', { headers: { Range: 'bytes=0-999999999' } }));
+    assert.equal(response.status, 206);
+    assert.equal(capturedRange, `bytes=0-${2 * 1024 * 1024 - 1}`);
+  } finally { globalThis.fetch = original; }
+});
+
 test('compressed media does not forward an incorrect compressed content length', async () => {
   const original = globalThis.fetch;
   globalThis.fetch = async () => new Response('decompressed content', { headers: { 'Content-Encoding': 'gzip', 'Content-Length': '5' } });
