@@ -18,8 +18,18 @@ export class HlsError extends Error {
 }
 
 export function isHlsTranscodingEnabled() {
-  // Separate serverless functions cannot share a child process or local cache.
-  return process.env.HLS_TRANSCODE_ENABLED !== '0' && !process.env.VERCEL;
+  // Separate serverless functions (Vercel, Netlify, AWS Lambda) cannot share a child process or local cache.
+  if (
+    process.env.VERCEL ||
+    process.env.NETLIFY ||
+    process.env.AWS_LAMBDA_FUNCTION_NAME ||
+    process.env.LAMBDA_TASK_ROOT ||
+    process.env.NOW_REGION ||
+    process.env.SERVERLESS
+  ) {
+    return false;
+  }
+  return process.env.HLS_TRANSCODE_ENABLED !== '0';
 }
 
 export function getFfmpegPath() {

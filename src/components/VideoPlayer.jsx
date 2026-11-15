@@ -304,10 +304,11 @@ function PlayerSession({
         const preference = qualityPreference.current;
         const manual = preference.mode === 'manual' && ordered.find((stream) => preference.height
           ? sourceResolution(stream) === preference.height : stream.url === preference.url);
-        const initial = manual || (isLive ? ordered[0] : initialQuality(ordered, navigator.connection));
+        const hevcSupported = browserSupportsHevc(videoRef.current);
+        const initial = manual || (isLive ? ordered[0] : initialQuality(ordered, navigator.connection, hevcSupported));
         if (preference.mode === 'manual' && !manual) { preference.mode = 'auto'; setAutoQuality(true); }
         qualityHealth.current.changedAt = Date.now();
-        setSelectedStream(playbackSource(initial, browserSupportsHevc(videoRef.current)));
+        setSelectedStream(playbackSource(initial, hevcSupported));
         if (data.duration && data.duration > 0) {
           setKnownDuration(data.duration);
         }

@@ -1,4 +1,4 @@
-import { sourceResolution } from './transcode-sources.js';
+import { sourceResolution, isHevcSource } from './transcode-sources.js';
 import { streamKind } from './playback.js';
 
 export function qualityLadder(streams) {
@@ -24,12 +24,17 @@ export function networkBudget(connection) {
   return connection?.effectiveType === '3g' ? 0.9 : null;
 }
 
-export function initialQuality(streams, connection) {
+export function initialQuality(streams, connection, supportsHevc = true) {
   const ladder = qualityLadder(streams);
   if (!ladder.length) return streams[0];
+
+  // If the browser does not support HEVC, prioritize native H.264 streams
+  const compatible = !supportsHevc ? ladder.filter((s) => !isHevcSource(s)) : ladder;
+  const pool = compatible.length > 0 ? compatible : ladder;
+
   const budget = networkBudget(connection);
-  const fits = ladder.filter((s) => budget === null ? sourceResolution(s) <= 480 : requiredMbps(s) <= budget);
-  return fits.at(-1) || ladder[0];
+  const fits = pool.filter((s) => budget === null ? sourceResolution(s) <= 480 : requiredMbps(s) <= budget);
+  return fits.at(-1) || pool[0];
 }
 
 export function adaptiveQuality({ streams, current, connection, bufferAhead, waitingMs,
